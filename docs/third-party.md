@@ -6,7 +6,7 @@ The Windows ZIP includes the HD and UHD replacement PNGs, launcher, configuratio
 | --- | --- | --- |
 | Rosalie's Mupen GUI and bundled GLideN64 | RMG Windows x64 0.9.1 | [RMG release and source](https://github.com/Rosalie241/RMG/releases/tag/v0.9.1) |
 | RetroArch | Windows x64 1.22.2, `69a4f0e` | [RetroArch source at 69a4f0e](https://github.com/libretro/RetroArch/tree/69a4f0ea1e8aaf442ae4858f2e7f2b31a1776576) |
-| Mupen64Plus-Next | Windows x64 libretro core, `15bada8` | [Corresponding source archive](https://github.com/IvoFehn/40-winks-hd/releases/download/v0.1.0/mupen64plus-next-15bada8-source.zip) · [Upstream tree](https://github.com/libretro/mupen64plus-libretro-nx/tree/15bada85906593376e8fd697f1b0b3af3a20f512) |
+| Mupen64Plus-Next | Windows x64 libretro core, `15bada8` | [Corresponding source archive](https://github.com/IvoFehn/40-winks-hd/releases/download/v0.1.1/mupen64plus-next-15bada8-source.zip) · [Upstream tree](https://github.com/libretro/mupen64plus-libretro-nx/tree/15bada85906593376e8fd697f1b0b3af3a20f512) |
 
 The core's license accompanies its archive in the release ZIP. [License](mupen64plus-next-LICENSE.txt)
 

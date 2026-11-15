@@ -2,15 +2,15 @@
 
 A fan-made texture rework of the Nintendo 64 version of *40 Winks* for Windows. It redraws the bedroom poster, ship decks, dungeon masonry, menu art, portraits and lettering while keeping the original game and levels.
 
-[Download the Windows preview](https://github.com/IvoFehn/40-winks-hd/releases/tag/v0.1.0)
+[Download the Windows preview](https://github.com/IvoFehn/40-winks-hd/releases/tag/v0.1.1)
 
 ## Play on Windows
 
-1. Download and extract **40-Winks-HD-v0.1.0-Windows-x64.zip** into a writable folder on an NTFS drive.
+1. Download and extract **40-Winks-HD-v0.1.1-Windows-x64.zip** into a writable folder on an NTFS drive.
 2. Put your own `.z64` next to **40 Winks HD.exe**. Use the European prototype dated **1999-10-07** (English, Spanish and Italian). The launcher checks the file contents, so the filename can vary.
 3. Open **40 Winks HD.exe** and choose a resolution and aspect ratio. Press **Enter** on the game's language screen to confirm. The first launch of each emulator mode needs an internet connection to download the pinned upstream emulator. Later starts use the files already set up.
 
-Windows 10 or 11 x64 with working OpenGL drivers is required. The release archive includes both texture packs. Supply the game separately.
+Windows 10 or 11 x64 with working OpenGL drivers is required. The release archive includes both texture packs. The ROM is supplied separately by the player.
 
 <details>
 <summary>ROM fingerprint and keyboard controls</summary>
@@ -40,7 +40,19 @@ The RMG and RetroArch modes keep separate saves in `game/runtime/rmg/Save` and `
 - The launcher offers 1920 × 1080, 2560 × 1440 and 3840 × 2160 display modes with 4:3 and 16:9 framing. **Native 4K** renders internally at 3840 × 2160 in 16:9 or 2880 × 2160 in 4:3, then fits the monitor.
 - Renderer adjustments address missing scenery and stale edge pixels in tested scenes, including Moon Caves, Dungeons and Dragon Race.
 
+## v0.1.1
+
+Each texture pack includes 121 revised files. All ten HUD digits now use a matching gold design, with cleaner edges and more room around the zero in two-digit counts. The moon, gear, RT badge and character icons were redrawn. This release also updates dialogue portraits and blink frames, two subtitle glyphs, and the joins on the Star Shuttle and The Magic Land posters.
+
 ## Before and after
+
+### Level select
+
+The comparison shows Ruff, the RT badge, the bat and moon icons with the earlier and revised textures. The new textures were captured at Full HD, WQHD and native 4K.
+
+![Four redrawn HUD icons in the level select screen](docs/images/hud-icons.jpg)
+
+[Gold HUD digits and gear](docs/images/hud-digits.jpg) · [Bedroom poster joins](docs/images/bedroom-poster-joins.jpg) · [Dialogue glyphs j and 1](docs/images/dialogue-glyphs.jpg)
 
 ### The bedroom
 
@@ -70,6 +82,6 @@ A close-up shows the lines across the earlier portrait on the left and the corre
 
 ## Status
 
-This preview captures the current rework. Some variants and later scenes are still being checked in play. The pack leaves three known conflicting texture keys to the emulator's original graphics because each key can refer to different artwork. [HD texture manifest](docs/hd-textures.csv) · [UHD texture manifest](docs/uhd-textures.csv)
+The Windows ZIP contains the complete HD and UHD packs for v0.1.1. The scene comparisons cover the changes shown above. Some rare effects and texture variants still need a check at their in-game locations. The pack leaves three known conflicting texture keys to the emulator's original graphics because each key can refer to different artwork. [HD texture manifest](docs/hd-textures.csv) · [UHD texture manifest](docs/uhd-textures.csv)
 
 This is an unofficial project. The original game and its characters belong to their respective rights holders. [Emulator credits and source](docs/third-party.md)
