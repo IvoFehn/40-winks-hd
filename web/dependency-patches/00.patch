@@ -1,0 +1,2314 @@
+diff --git a/librecomp/CMakeLists.txt b/librecomp/CMakeLists.txt
+index 716d48b..56c2de4 100644
+--- a/librecomp/CMakeLists.txt
++++ b/librecomp/CMakeLists.txt
+@@ -18,6 +18,7 @@ add_library(librecomp STATIC
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/files.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/flash.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/heap.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/kuseg.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/math_routines.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/mods.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_events.cpp"
+@@ -63,5 +64,10 @@ endif()
+ add_subdirectory(${PROJECT_SOURCE_DIR}/../thirdparty/miniz ${CMAKE_CURRENT_BINARY_DIR}/miniz)
+ add_subdirectory(${PROJECT_SOURCE_DIR}/../N64Recomp ${CMAKE_CURRENT_BINARY_DIR}/N64Recomp EXCLUDE_FROM_ALL)
+ 
+-target_link_libraries(librecomp PRIVATE ultramodern N64Recomp LiveRecomp)
++# WebAssembly can't generate code at runtime, so Emscripten builds have no live recompiler (mods that need it don't load).
++if (EMSCRIPTEN)
++    target_link_libraries(librecomp PRIVATE ultramodern N64Recomp)
++else()
++    target_link_libraries(librecomp PRIVATE ultramodern N64Recomp LiveRecomp)
++endif()
+ target_link_libraries(librecomp PUBLIC miniz)
+diff --git a/librecomp/include/librecomp/addresses.hpp b/librecomp/include/librecomp/addresses.hpp
+index b1b50cb..4c11af7 100644
+--- a/librecomp/include/librecomp/addresses.hpp
++++ b/librecomp/include/librecomp/addresses.hpp
+@@ -9,7 +9,18 @@ namespace recomp {
+     // 512GB (kseg0 size)
+     constexpr size_t mem_size = 512ULL * 1024ULL * 1024ULL;
+     // 4GB (the full address space)
++#ifdef __EMSCRIPTEN__
++    // A 32-bit address space can't reserve 4 GiB, and WebAssembly memory has no page protection to catch stray
++    // accesses with anyway. A recomp built with RECOMP_KUSEG_WINDOW gets KUSEG's window right after kseg0 (recomp.h).
++#ifdef RECOMP_KUSEG_WINDOW
++    static_assert(RECOMP_KUSEG_WINDOW_BASE == mem_size);
++    constexpr size_t allocation_size = mem_size + RECOMP_KUSEG_WINDOW_SIZE;
++#else
++    constexpr size_t allocation_size = mem_size;
++#endif
++#else
+     constexpr size_t allocation_size = 4096ULL * 1024ULL * 1024ULL;
++#endif
+     // We need a place in rdram to hold the PI handles, so pick an address in extended rdram
+     constexpr int32_t cart_handle = 0x80800000;
+     constexpr int32_t drive_handle = (int32_t)(cart_handle + sizeof(OSPiHandle));
+@@ -26,6 +37,13 @@ namespace recomp {
+     constexpr uint32_t rom_base = 0x10000000;
+     constexpr uint32_t drive_base = 0x06000000;
+ 
++    // Makes [vaddr, vaddr + size) of KUSEG (TLB-mapped addresses, below 0x80000000) readable and writable, for a recomp
++    // whose code reads its strings, tables and constants through them: on a native build by opening the pages of
++    // allocation_size's range it reserves there, and on the web if the range lies in the window RECOMP_KUSEG_WINDOW
++    // allocates (recomp.h). It starts zeroed, and the recomp fills it (do_rom_read writes through these addresses).
++    // False if the range can't be opened: on the web past the window, or without RECOMP_KUSEG_WINDOW.
++    bool make_kuseg_accessible(uint8_t* rdram, uint32_t vaddr, uint32_t size);
++
+     void register_heap_exports();
+     void init_heap(uint8_t* rdram, uint32_t address);
+     void* alloc(uint8_t* rdram, size_t size);
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index 37556bd..9380157 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -50,12 +50,16 @@ template <>
+ struct std::hash<recomp::mods::HookDefinition>
+ {
+     std::size_t operator()(const recomp::mods::HookDefinition& def) const {
+-        // This hash packing only works if the resulting value is 64 bits.
+-        static_assert(sizeof(std::size_t) == 8);
+         // Combine the three values into a single 64-bit value.
+         // The lower 2 bits of a function address will always be zero, so pack
+         // the value of at_return into the lowest bit.
+-        return (size_t(def.section_rom) << 32) | size_t(def.function_vram) | size_t(def.at_return ? 1 : 0);
++        uint64_t packed = (uint64_t(def.section_rom) << 32) | uint64_t(def.function_vram) | uint64_t(def.at_return ? 1 : 0);
++        if constexpr (sizeof(std::size_t) == 8) {
++            return packed;
++        }
++        else {
++            return std::hash<uint64_t>{}(packed);
++        }
+     }
+ };
+ 
+@@ -340,6 +344,7 @@ namespace recomp {
+ 
+             void register_game(const std::string& mod_game_id);
+             void register_embedded_mod(const std::string& mod_id, std::span<const uint8_t> mod_bytes);
++            void register_precompiled_mod(const recomp_precompiled_mod& code);
+             void register_deprecated_mod(const std::string& mod_id, DeprecationStatus deprecation_status, const Version& maximum_version);
+             std::vector<ModOpenErrorDetails> scan_mod_folder(const std::filesystem::path& mod_folder);
+             void close_mods();
+@@ -407,6 +412,8 @@ namespace recomp {
+             // Maps game mod ID to the mod's internal integer ID. 
+             std::unordered_map<std::string, size_t> mod_game_ids;
+             std::unordered_map<std::string, std::span<const uint8_t>> embedded_mod_bytes;
++            // Mods' code recompiled ahead of time, by the hash of the mod files it was made from (mod_code_hash).
++            std::unordered_map<uint64_t, const recomp_precompiled_mod*> precompiled_mods;
+             std::vector<ModHandle> opened_mods;
+             std::unordered_map<std::string, size_t> opened_mods_by_id;
+             std::unordered_map<std::filesystem::path::string_type, size_t> opened_mods_by_filename;
+@@ -465,6 +472,8 @@ namespace recomp {
+             config::Config config;
+             std::unique_ptr<ModCodeHandle> code_handle;
+             std::unique_ptr<N64Recomp::Context> recompiler_context;
++            // This mod's code recompiled ahead of time, if the recomp has it (register_precompiled_mod).
++            const recomp_precompiled_mod* precompiled_code = nullptr;
+             std::vector<uint32_t> section_load_addresses;
+             // Content types present in this mod.
+             std::vector<ModContentTypeId> content_types;
+@@ -574,6 +583,29 @@ namespace recomp {
+             int32_t* section_addresses;
+         };
+ 
++        // A mod's code recompiled ahead of time and linked into the executable (recomp_precompiled_mod in recomp.h), for a
++        // platform without the live recompiler. It calls the runtime's functions directly, so it's given no pointers to them.
++        class PrecompiledCodeHandle : public ModCodeHandle {
++        public:
++            PrecompiledCodeHandle(const recomp_precompiled_mod& code, const N64Recomp::Context& context, const ModCodeHandleInputs& inputs);
++            bool good() final { return is_good; }
++            uint32_t get_api_version() final { return 1; }
++            void set_imported_function(size_t import_index, GenericFunction func) final;
++            CodeModLoadError populate_reference_symbols(const N64Recomp::Context& context, std::string& error_param) final;
++            uint32_t get_base_event_index() final {
++                return *code.base_event_index;
++            }
++            void set_local_section_address(size_t section_index, int32_t address) final {
++                code.section_addresses[section_index] = address;
++            }
++            GenericFunction get_function_handle(size_t func_index) final {
++                return GenericFunction{ code.functions[func_index] };
++            }
++        private:
++            const recomp_precompiled_mod& code;
++            bool is_good;
++        };
++
+         class LiveRecompilerCodeHandle : public ModCodeHandle {
+         public:
+             LiveRecompilerCodeHandle(const N64Recomp::Context& context, const ModCodeHandleInputs& inputs,
+@@ -622,6 +654,10 @@ namespace recomp {
+ 
+         void initialize_mods();
+         void register_embedded_mod(const std::string& mod_id, std::span<const uint8_t> mod_bytes);
++        // Code for a mod (an embedded one, typically) recompiled ahead of time with OfflineModRecomp --static, which the
++        // runtime runs for a mod whose files it was made from, in place of recompiling it as it loads. Needed where
++        // there's no live recompiler (WebAssembly), where without it a mod with code fails to load.
++        void register_precompiled_mod(const recomp_precompiled_mod& code);
+         void register_deprecated_mod(const std::string& mod_id, DeprecationStatus deprecation_status, const Version &maximum_version);
+         void scan_mods();
+         void close_mods();
+diff --git a/librecomp/include/librecomp/rsp.hpp b/librecomp/include/librecomp/rsp.hpp
+index 748558c..075a601 100644
+--- a/librecomp/include/librecomp/rsp.hpp
++++ b/librecomp/include/librecomp/rsp.hpp
+@@ -6,6 +6,7 @@
+ #include "rsp_vu.hpp"
+ #include "recomp.h"
+ #include "ultramodern/ultra64.h"
++#include "ultramodern/rsp.hpp"
+ 
+ // TODO: Move these to recomp namespace?
+ 
+@@ -98,8 +99,11 @@ static inline void dma_rdram_to_dmem(uint8_t* rdram, uint32_t dmem_addr, uint32_
+     rd_len += 1; // Read length is inclusive
+     dram_addr &= 0xFFFFF8;
+     assert(dmem_addr + rd_len <= 0x1000);
++    // The running task's data as the game submitted it, where ultramodern runs the task from a copy (its rsp.hpp)
++    const ultramodern::rsp::SubmittedData& data = ultramodern::rsp::submitted_data;
+     for (uint32_t i = 0; i < rd_len; i++) {
+-        RSP_MEM_B(i, dmem_addr) = MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000));
++        const uint32_t data_offset = dram_addr + i - data.address;
++        RSP_MEM_B(i, dmem_addr) = data_offset < data.size ? data.bytes[data_offset ^ 3] : MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000));
+     }
+ }
+ 
+@@ -107,8 +111,13 @@ static inline void dma_dmem_to_rdram(uint8_t* rdram, uint32_t dmem_addr, uint32_
+     wr_len += 1; // Write length is inclusive
+     dram_addr &= 0xFFFFF8;
+     assert(dmem_addr + wr_len <= 0x1000);
++    const ultramodern::rsp::SubmittedData& data = ultramodern::rsp::submitted_data;
+     for (uint32_t i = 0; i < wr_len; i++) {
+         MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000)) = RSP_MEM_B(i, dmem_addr);
++        const uint32_t data_offset = dram_addr + i - data.address;
++        if (data_offset < data.size) {
++            data.bytes[data_offset ^ 3] = RSP_MEM_B(i, dmem_addr);
++        }
+     }
+ }
+ 
+diff --git a/librecomp/src/config.cpp b/librecomp/src/config.cpp
+index f54593c..5017d2c 100644
+--- a/librecomp/src/config.cpp
++++ b/librecomp/src/config.cpp
+@@ -368,9 +368,20 @@ nlohmann::json Config::get_json_config() const {
+ 
+ nlohmann::json Config::get_storage_json() const {
+     nlohmann::json json;
++#ifdef __EMSCRIPTEN__
++    json = nlohmann::json::object();
++#endif
+     for (const auto& option : schema.options) {
+         const ConfigValueVariant value = get_option_value(option.id);
+ 
++#ifdef __EMSCRIPTEN__
++        // A page's build changes under its player at every update, so only what the player changed is saved: an option
++        // left at its default follows the default of the build that reads the file, not the one that first wrote it.
++        if (value == get_option_default_value(option.id)) {
++            continue;
++        }
++#endif
++
+         if (json_serialize_option_map.contains(option.id)) {
+             auto cb = json_serialize_option_map.at(option.id);
+             json[option.id] = cb(value);
+@@ -469,6 +480,12 @@ void Config::derive_all_config_option_dependencies() {
+ }
+ 
+ ConfigValueVariant Config::parse_config_option_json_value(const nlohmann::json& json_value, const ConfigOption &option) {
++#ifdef __EMSCRIPTEN__
++    // An option the file leaves out is at its default (get_storage_json), which an option's own parser isn't given.
++    if (json_value.is_null()) {
++        return get_option_default_value(option.id);
++    }
++#endif
+     if (json_parse_option_map.contains(option.id)) {
+         return json_parse_option_map[option.id](json_value);
+     }
+diff --git a/librecomp/src/flash.cpp b/librecomp/src/flash.cpp
+index f46261c..0e9ef28 100644
+--- a/librecomp/src/flash.cpp
++++ b/librecomp/src/flash.cpp
+@@ -94,13 +94,8 @@ extern "C" void osFlashSectorErase_recomp(uint8_t * rdram, recomp_context * ctx)
+         ULTRAMODERN_QUICK_EXIT();
+     }
+ 
+-    uint32_t page_num = (uint32_t)ctx->r4;
+-
+-    // Prevent out of bounds erase
+-    if (page_num >= page_count) {
+-        ctx->r2 = -1;
+-        return;
+-    }
++    // The chip's page number wraps at its page count, as on a console.
++    uint32_t page_num = (uint32_t)ctx->r4 % page_count;
+ 
+     save_clear(page_num * page_size, page_size, 0xFF);
+ 
+@@ -114,13 +109,8 @@ extern "C" void osFlashSectorEraseThrough_recomp(uint8_t * rdram, recomp_context
+         ULTRAMODERN_QUICK_EXIT();
+     }
+ 
+-    uint32_t page_num = (uint32_t)ctx->r4;
+-
+-    // Prevent out of bounds erase
+-    if (page_num >= page_count) {
+-        ctx->r2 = -1;
+-        return;
+-    }
++    // The chip's page number wraps at its page count, as on a console.
++    uint32_t page_num = (uint32_t)ctx->r4 % page_count;
+ 
+     save_clear(page_num * page_size, page_size, 0xFF);
+ 
+@@ -167,8 +157,8 @@ extern "C" void osFlashWriteArray_recomp(uint8_t * rdram, recomp_context * ctx)
+ 
+     uint32_t page_num = ctx->r4;
+ 
+-    // Copy the write buffer into the save file
+-    save_write_ptr(write_buffer.data(), page_num * page_size, page_size);
++    // Copy the write buffer into the save file. The chip's page number wraps at its page count, as on a console.
++    save_write_ptr(write_buffer.data(), (page_num % page_count) * page_size, page_size);
+ 
+     ctx->r2 = 0;
+ }
+@@ -186,11 +176,12 @@ extern "C" void osFlashReadArray_recomp(uint8_t * rdram, recomp_context * ctx) {
+     uint32_t n_pages = MEM_W(0x10, ctx->r29);
+     PTR(OSMesgQueue) mq = MEM_W(0x14, ctx->r29);
+ 
+-    uint32_t offset = page_num * page_size;
+-    uint32_t count = n_pages * page_size;
+-
+-    // Read from the save file into the provided buffer
+-    save_read(PASS_RDRAM dramAddr, offset, count);
++    // Read from the save file into the provided buffer, a page at a time: the chip's page number wraps at its page
++    // count, so a page outside it (Paper Mario's file menu reads page -128 for a file with no save yet) reads one
++    // inside it, as on a console, where the game then finds its checksum wrong, and never memory past the save.
++    for (uint32_t i = 0; i < n_pages; i++) {
++        save_read(PASS_RDRAM dramAddr + i * page_size, ((page_num + i) % page_count) * page_size, page_size);
++    }
+ 
+     // Send the message indicating read completion
+     ultramodern::enqueue_external_message_src(mq, 0, false, ultramodern::EventMessageSource::Pi);
+diff --git a/librecomp/src/kuseg.cpp b/librecomp/src/kuseg.cpp
+new file mode 100644
+index 0000000..29c60ca
+--- /dev/null
++++ b/librecomp/src/kuseg.cpp
+@@ -0,0 +1,36 @@
++// KUSEG memory for a recomp whose code reads through TLB-mapped addresses (recomp::make_kuseg_accessible, addresses.hpp).
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <Windows.h>
++#elif !defined(__EMSCRIPTEN__)
++#include <sys/mman.h>
++#endif
++
++#include "librecomp/addresses.hpp"
++
++bool recomp::make_kuseg_accessible(uint8_t* rdram, uint32_t vaddr, uint32_t size) {
++    if (size == 0 || vaddr >= 0x80000000u || size > 0x80000000u - vaddr) {
++        return false;
++    }
++#ifdef __EMSCRIPTEN__
++    // The window is part of RDRAM's allocation, and WebAssembly memory is all accessible.
++    (void)rdram;
++#ifdef RECOMP_KUSEG_WINDOW
++    return vaddr + size <= RECOMP_KUSEG_WINDOW_SIZE;
++#else
++    return false;
++#endif
++#else
++    // A KUSEG address lies 2 GB or more past rdram, as the generated code computes it (recomp.h's RECOMP_RDRAM_OFFSET).
++    constexpr uint32_t page = 0x1000;
++    uint32_t start = vaddr & ~(page - 1);
++    uint32_t end = (uint32_t)(((uint64_t)vaddr + size + page - 1) & ~(uint64_t)(page - 1));
++    uint8_t* host = rdram + 0x80000000ULL + start;
++#ifdef _WIN32
++    // The range past mem_size is reserved and not committed (recomp.cpp), which VirtualProtect can't open.
++    return VirtualAlloc(host, end - start, MEM_COMMIT, PAGE_READWRITE) != nullptr;
++#else
++    return mprotect(host, end - start, PROT_READ | PROT_WRITE) == 0;
++#endif
++#endif
++}
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
+index 0f7de83..6c5555d 100644
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -74,6 +74,9 @@ bool get_to_vec(const nlohmann::json& val, std::vector<T2>& out) {
+ // MSVC/GCC/Clang ARM64
+ #elif defined(__ARM_ARCH_ISA_A64)
+ #   define IS_ARM64
++// WebAssembly: code can't be patched or generated at runtime.
++#elif defined(__wasm__)
++#   define IS_WASM
+ #else
+ #   error "Unsupported architecture!"
+ #endif
+@@ -454,7 +457,9 @@ void recomp::mods::DynamicLibraryCodeHandle::set_imported_function(size_t import
+     }, func);
+ }
+ 
+-recomp::mods::CodeModLoadError recomp::mods::DynamicLibraryCodeHandle::populate_reference_symbols(const N64Recomp::Context& context, std::string& error_param) {
++// Fills a mod's array of the base ROM's functions it calls, for code recompiled ahead of time (a DLL, or linked in).
++static recomp::mods::CodeModLoadError populate_reference_symbol_funcs(const N64Recomp::Context& context, recomp_func_t** reference_symbol_funcs, std::string& error_param) {
++    using namespace recomp::mods;
+     size_t reference_symbol_index = 0;
+     for (const auto& section : context.sections) {
+         for (const auto& reloc : section.relocs) {
+@@ -476,10 +481,35 @@ recomp::mods::CodeModLoadError recomp::mods::DynamicLibraryCodeHandle::populate_
+     return CodeModLoadError::Good;
+ }
+ 
++recomp::mods::CodeModLoadError recomp::mods::DynamicLibraryCodeHandle::populate_reference_symbols(const N64Recomp::Context& context, std::string& error_param) {
++    return populate_reference_symbol_funcs(context, reference_symbol_funcs, error_param);
++}
++
++recomp::mods::PrecompiledCodeHandle::PrecompiledCodeHandle(const recomp_precompiled_mod& code, const N64Recomp::Context& context, const ModCodeHandleInputs& inputs) : code(code) {
++    is_good = code.num_functions == context.functions.size();
++    *code.base_event_index = inputs.base_event_index;
++    *code.reference_section_addresses = inputs.reference_section_addresses;
++}
++
++void recomp::mods::PrecompiledCodeHandle::set_imported_function(size_t import_index, GenericFunction func) {
++    std::visit(overloaded {
++        [this, import_index](recomp_func_t* native_func) {
++            code.imported_funcs[import_index] = native_func;
++        }
++    }, func);
++}
++
++recomp::mods::CodeModLoadError recomp::mods::PrecompiledCodeHandle::populate_reference_symbols(const N64Recomp::Context& context, std::string& error_param) {
++    return populate_reference_symbol_funcs(context, code.reference_symbol_funcs, error_param);
++}
++
+ recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
+     const N64Recomp::Context& context, const ModCodeHandleInputs& inputs,
+     std::unordered_map<size_t, size_t>&& entry_func_hooks, std::unordered_map<size_t, size_t>&& return_func_hooks, std::vector<size_t>&& original_section_indices, bool regenerated)
+ {
++#ifdef IS_WASM
++    is_good = false;
++#else
+     if (!regenerated) {
+        section_addresses = std::make_unique<int32_t[]>(context.sections.size());
+     }
+@@ -521,8 +551,12 @@ recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
+     // Generate the code.
+     recompiler_output = std::make_unique<N64Recomp::LiveGeneratorOutput>(generator.finish());
+     is_good = !errored && recompiler_output->good;
++#endif
+ }
+ 
++// Without a live recompiler a handle is never good, so the functions below are never called.
++#ifndef IS_WASM
++
+ void recomp::mods::LiveRecompilerCodeHandle::set_imported_function(size_t import_index, GenericFunction func) {
+     std::visit(overloaded {
+         [this, import_index](recomp_func_t* native_func) {
+@@ -554,8 +588,135 @@ recomp::mods::CodeModLoadError recomp::mods::LiveRecompilerCodeHandle::populate_
+ recomp::mods::GenericFunction recomp::mods::LiveRecompilerCodeHandle::get_function_handle(size_t func_index) {
+     return GenericFunction{ recompiler_output->functions[func_index] };
+ }
++#else
++void recomp::mods::LiveRecompilerCodeHandle::set_imported_function(size_t, GenericFunction) {}
++
++recomp::mods::CodeModLoadError recomp::mods::LiveRecompilerCodeHandle::populate_reference_symbols(const N64Recomp::Context&, std::string&) {
++    return CodeModLoadError::Good;
++}
++
++recomp::mods::GenericFunction recomp::mods::LiveRecompilerCodeHandle::get_function_handle(size_t) {
++    return GenericFunction{ static_cast<recomp_func_t*>(nullptr) };
++}
++
++// LiveRecomp, which generates these, isn't linked. Nothing creates one, but librecomp still names it.
++N64Recomp::LiveGeneratorOutput::~LiveGeneratorOutput() {}
++
++// A shim calls a function that takes a value (recomp_func_ext_t) from a call that passes none (recomp_func_t): the
++// config API given the calling mod's index, for one. LiveRecomp generates each one as code, so here they're the slots
++// of a fixed pool of functions, each of which calls what its slot holds. `code` points at the slot.
++namespace {
++    struct ShimSlot {
++        recomp_func_ext_t* func;
++        uintptr_t value;
++    };
++    constexpr size_t num_shim_slots = 1024;
++    ShimSlot shim_slots[num_shim_slots]{};
++    std::mutex shim_slots_mutex;
++
++    template <size_t index>
++    void shim_slot_func(uint8_t* rdram, recomp_context* ctx) {
++        shim_slots[index].func(rdram, ctx, shim_slots[index].value);
++    }
++
++    template <size_t... indices>
++    constexpr std::array<recomp_func_t*, sizeof...(indices)> make_shim_slot_funcs(std::index_sequence<indices...>) {
++        return { shim_slot_func<indices>... };
++    }
++    constexpr std::array<recomp_func_t*, num_shim_slots> shim_slot_funcs = make_shim_slot_funcs(std::make_index_sequence<num_shim_slots>{});
++}
++
++N64Recomp::ShimFunction::ShimFunction(recomp_func_ext_t* to_shim, uintptr_t value) : code(nullptr), func(nullptr) {
++    std::lock_guard lock{ shim_slots_mutex };
++    for (size_t i = 0; i < num_shim_slots; i++) {
++        if (shim_slots[i].func == nullptr) {
++            shim_slots[i] = ShimSlot{ to_shim, value };
++            code = &shim_slots[i];
++            func = shim_slot_funcs[i];
++            return;
++        }
++    }
++    assert(false && "Out of shim slots");
++}
++
++N64Recomp::ShimFunction::~ShimFunction() {
++    std::lock_guard lock{ shim_slots_mutex };
++    if (code != nullptr) {
++        static_cast<ShimSlot*>(code)->func = nullptr;
++    }
++}
++#endif
++
++#if defined(IS_WASM)
++// WebAssembly can't rewrite a function's code, so there a mod's replacement of a recompiled function (patch_func) and
++// the hooks the live recompiler would add to a copy of it are kept here, and every recompiled function asks at its entry
++// (RECOMP_FUNC_ENTRY in recomp.h): a byte per function table index, which is a function pointer's value, set for one
++// with a redirect, and what to run for it.
++extern "C" const uint8_t* recomp_redirected = nullptr;
++extern "C" uintptr_t recomp_redirected_count = 0;
++
++namespace {
++    struct Redirect {
++        recomp_func_t* replacement = nullptr;
++        size_t entry_hook = SIZE_MAX;
++        size_t return_hook = SIZE_MAX;
++    };
++    std::vector<uint8_t> redirected_funcs;
++    std::unordered_map<uintptr_t, Redirect> redirects;
++    // A hooked function that recomp_redirect has called, to run itself when its entry asks.
++    thread_local uintptr_t redirect_bypass = 0;
++
++    // Only while mods load, before the game's threads run.
++    Redirect& add_redirect(recomp_func_t* func) {
++        uintptr_t index = reinterpret_cast<uintptr_t>(func);
++        if (index >= redirected_funcs.size()) {
++            redirected_funcs.resize(index + 1);
++        }
++        redirected_funcs[index] = 1;
++        recomp_redirected = redirected_funcs.data();
++        recomp_redirected_count = redirected_funcs.size();
++        return redirects[index];
++    }
++
++    void reset_redirects() {
++        recomp_redirected_count = 0;
++        recomp_redirected = nullptr;
++        redirected_funcs.clear();
++        redirects.clear();
++    }
++}
++
++extern "C" int recomp_redirect(uint8_t* rdram, recomp_context* ctx, uintptr_t func) {
++    if (redirect_bypass == func) {
++        redirect_bypass = 0;
++        return 0;
++    }
++    auto find_it = redirects.find(func);
++    if (find_it == redirects.end()) {
++        return 0;
++    }
++    const Redirect& redirect = find_it->second;
++    if (redirect.entry_hook != SIZE_MAX) {
++        recomp::mods::run_hook(rdram, ctx, redirect.entry_hook);
++    }
++    if (redirect.replacement != nullptr) {
++        redirect.replacement(rdram, ctx);
++    }
++    else {
++        redirect_bypass = func;
++        reinterpret_cast<recomp_func_t*>(func)(rdram, ctx);
++    }
++    if (redirect.return_hook != SIZE_MAX) {
++        recomp::mods::run_hook(rdram, ctx, redirect.return_hook);
++    }
++    return 1;
++}
++#endif
+ 
+ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replacement_func) {
++#if defined(IS_WASM)
++    add_redirect(target_func).replacement = std::get<recomp_func_t*>(replacement_func);
++#else
+     uint8_t* target_func_u8 = reinterpret_cast<uint8_t*>(target_func);
+     size_t offset = 0;
+ 
+@@ -590,13 +751,20 @@ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replac
+ #endif
+ 
+     protect(target_func_u8, old_flags);
++#endif
+ }
+ 
+ void unpatch_func(void* target_func, const recomp::mods::PatchData& data) {
++#if defined(IS_WASM)
++    // unload_mods drops every redirect at once.
++    (void)target_func;
++    (void)data;
++#else
+     uint64_t old_flags;
+     unprotect(target_func, &old_flags);
+     memcpy(target_func, data.replaced_bytes.data(), data.replaced_bytes.size());
+     protect(target_func, old_flags);
++#endif
+ }
+ 
+ void recomp::mods::ModContext::add_opened_mod(ModManifest&& manifest, config::Config&& config, std::vector<size_t>&& game_indices, std::vector<ModContentTypeId>&& detected_content_types, std::vector<char>&& thumbnail) {
+@@ -636,6 +804,10 @@ void recomp::mods::ModContext::register_embedded_mod(const std::string &mod_id,
+     embedded_mod_bytes.emplace(mod_id, mod_bytes);
+ }
+ 
++void recomp::mods::ModContext::register_precompiled_mod(const recomp_precompiled_mod& code) {
++    precompiled_mods.emplace(code.hash, &code);
++}
++
+ void recomp::mods::ModContext::register_deprecated_mod(const std::string& mod_id, DeprecationStatus deprecation_status, const Version &maximum_version) {
+     deprecated_mods[mod_id].status = deprecation_status;
+     deprecated_mods[mod_id].maximum_version = maximum_version;
+@@ -2017,6 +2189,23 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
+     return {};
+ }
+ 
++#if defined(IS_WASM)
++// In WebAssembly a hooked function isn't regenerated with its hooks: recomp_redirect runs them around it.
++void redirect_hooks(const RegeneratedList& regenlist) {
++    for (size_t func_index = 0; func_index < regenlist.func_ptrs.size(); func_index++) {
++        Redirect& redirect = add_redirect(regenlist.func_ptrs[func_index]);
++        auto find_entry_it = regenlist.entry_func_hooks.find(func_index);
++        if (find_entry_it != regenlist.entry_func_hooks.end()) {
++            redirect.entry_hook = find_entry_it->second;
++        }
++        auto find_return_it = regenlist.return_func_hooks.find(func_index);
++        if (find_return_it != regenlist.return_func_hooks.end()) {
++            redirect.return_hook = find_return_it->second;
++        }
++    }
++}
++#endif
++
+ std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(RegeneratedList& regenlist, std::span<const uint8_t> rom) {
+     using namespace recomp::mods;
+ 
+@@ -2082,6 +2271,9 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
+ 
+     // Apply the regenlist.
+     if (!regenlist.functions.empty()) {
++#if defined(IS_WASM)
++        redirect_hooks(regenlist);
++#else
+         regenerated_code_handle = apply_regenlist(regenlist, decompressed_rom);
+         if (!regenerated_code_handle || !regenerated_code_handle->good()) {
+             regenerated_code_handle.reset();
+@@ -2090,6 +2282,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
+             });
+             return ret;
+         }
++#endif
+     }
+ 
+     if (!regenlist.patched_hooks.empty()) {
+@@ -2130,6 +2323,9 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
+         }
+ 
+         // Apply the patched function regenlist.
++#if defined(IS_WASM)
++        redirect_hooks(patch_regenlist);
++#else
+         base_patched_code_handle = apply_regenlist(patch_regenlist, overlays::get_patch_binary());
+         if (!base_patched_code_handle || !base_patched_code_handle->good()) {
+             regenerated_code_handle.reset();
+@@ -2139,6 +2335,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::regener
+             });
+             return ret;
+         }
++#endif
+     }
+ 
+     return ret;
+@@ -2196,6 +2393,10 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::init_mod_code(uint8_t*
+ 
+     std::span<uint8_t> binary_span {reinterpret_cast<uint8_t*>(binary_data.data()), binary_data.size() };
+ 
++    // Use this mod's code recompiled ahead of time if the recomp has it.
++    auto find_precompiled_it = precompiled_mods.find(N64Recomp::mod_code_hash(binary_span, syms_data));
++    mod.precompiled_code = find_precompiled_it != precompiled_mods.end() ? find_precompiled_it->second : nullptr;
++
+     // Parse the symbol file into the recompiler context.
+     N64Recomp::ModSymbolsError symbol_load_error = N64Recomp::parse_mod_symbols(syms_data, binary_span, section_vrom_map, *mod.recompiler_context);
+     if (symbol_load_error != N64Recomp::ModSymbolsError::Good) {
+@@ -2367,10 +2568,28 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t*
+         .reference_section_addresses = section_addresses,
+     };
+ 
++    // Code recompiled ahead of time and linked in (register_precompiled_mod).
++    if (mod.precompiled_code != nullptr) {
++#if !defined(IS_WASM)
++        // Hooks can't be added to it either.
++        if (!entry_func_hooks.empty() || !return_func_hooks.empty()) {
++            return CodeModLoadError::OfflineModHooked;
++        }
++#endif
++        // In WebAssembly a replacement is a redirect, and the hooks on the function it replaces run around it
++        // (resolve_code_dependencies), as the live recompiler would add them to its code.
++
++        mod.code_handle = std::make_unique<PrecompiledCodeHandle>(*mod.precompiled_code, *mod.recompiler_context, handle_inputs);
++        if (!mod.code_handle->good()) {
++            mod.code_handle.reset();
++            error_param = mod.manifest.mod_id;
++            return CodeModLoadError::FailedToLoadNativeCode;
++        }
++    }
+     // Use a dynamic library code handle. This feature isn't meant to be used by end users, but provides a more debuggable
+     // experience than the live recompiler for mod developers.
+     // Enabled if the mod's filename ends with ".offline.nrm".
+-    if (mod.manifest.mod_root_path.filename().string().ends_with(".offline.nrm")) {
++    else if (mod.manifest.mod_root_path.filename().string().ends_with(".offline.nrm")) {
+         // Hooks can't be generated for native mods, so return an error if any of the functions this mod replaces are also hooked by another mod.
+         if (!entry_func_hooks.empty() || !return_func_hooks.empty()) {
+             return CodeModLoadError::OfflineModHooked;
+@@ -2630,11 +2849,26 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
+ 
+         // Copy the original bytes so they can be restored later after the mod is unloaded.
+         PatchData& cur_replacement_data = patched_funcs[to_replace];
++#if !defined(IS_WASM)
+         memcpy(cur_replacement_data.replaced_bytes.data(), reinterpret_cast<void*>(to_replace), cur_replacement_data.replaced_bytes.size());
++#endif
+         cur_replacement_data.mod_id = mod.manifest.mod_id;
+ 
+         // Patch the function to redirect it to the replacement.
+         patch_func(to_replace, mod.code_handle->get_function_handle(replacement.func_index));
++#if defined(IS_WASM)
++        // The hooks on the function it replaces run around the replacement (load_mod_code): another mod's, or this one's
++        // own (a mod may hook a function it replaces itself).
++        Redirect& redirect = add_redirect(to_replace);
++        auto find_entry_it = hook_slots.find(HookDefinition{ replacement.original_section_vrom, replacement.original_vram, false });
++        if (find_entry_it != hook_slots.end()) {
++            redirect.entry_hook = find_entry_it->second;
++        }
++        auto find_return_it = hook_slots.find(HookDefinition{ replacement.original_section_vrom, replacement.original_vram, true });
++        if (find_return_it != hook_slots.end()) {
++            redirect.return_hook = find_return_it->second;
++        }
++#endif
+     }
+ 
+     return CodeModLoadError::Good;
+@@ -2645,6 +2879,9 @@ void recomp::mods::ModContext::unload_mods() {
+         unpatch_func(reinterpret_cast<void*>(replacement_func), replacement_data);
+     }
+     patched_funcs.clear();
++#if defined(IS_WASM)
++    reset_redirects();
++#endif
+     loaded_mods_by_id.clear();
+     hook_slots.clear();
+     processed_hook_slots.clear();
+diff --git a/librecomp/src/overlays.cpp b/librecomp/src/overlays.cpp
+index 8c8e5d1..68771e8 100644
+--- a/librecomp/src/overlays.cpp
++++ b/librecomp/src/overlays.cpp
+@@ -198,8 +198,9 @@ extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
+             return addr < entry.size + entry.rom_addr;
+         }
+     );
+-    // Load the overlays that were found
+-    for (auto it = lower; it != upper; ++it) {
++    // Load the overlays that were found. A range inside one section (a game reading an overlay in pieces) has no
++    // section wholly in it and puts upper before lower, so the loop ends at upper or past it.
++    for (auto it = lower; it < upper; ++it) {
+         load_overlay(std::distance(&sections_info.code_sections[0], it), it->rom_addr - rom + ram_addr);
+     }
+ }
+diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
+index 43509ba..71ee4d9 100644
+--- a/librecomp/src/pi.cpp
++++ b/librecomp/src/pi.cpp
+@@ -271,6 +271,8 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
+     // TODO implement unaligned DMA correctly
+     if (direction == 0) {
+         if (physical_addr >= recomp::rom_base) {
++            // Not onto commands of a display list the renderer hasn't read yet (ultramodern's displaylists.cpp).
++            ultramodern::wait_for_displaylists_read((uint32_t)rdram_address & 0x1FFFFFFF, size);
+             // read cart rom
+             recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
+ 
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 850689d..8cad9c1 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -32,6 +32,13 @@
+ #    include <sys/mman.h>
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++#    include <fcntl.h>
++#    include <sys/stat.h>
++#    include <unistd.h>
++#    include <emscripten.h>
++#endif
++
+ #if defined(_WIN32)
+ #define PATHFMT "%ls"
+ #else
+@@ -90,7 +97,9 @@ bool recomp::register_game(const recomp::GameEntry& entry) {
+ }
+ 
+ void recomp::mods::initialize_mods() {
++#ifndef __EMSCRIPTEN__
+     N64Recomp::live_recompiler_init();
++#endif
+     std::filesystem::create_directories(config_path / mods_directory);
+     std::filesystem::create_directories(config_path / mod_config_directory);
+     mod_context->set_mods_config_path(config_path / "mods.json");
+@@ -102,6 +111,11 @@ void recomp::mods::register_embedded_mod(const std::string &mod_id, std::span<co
+     mod_context->register_embedded_mod(mod_id, mod_bytes);
+ }
+ 
++void recomp::mods::register_precompiled_mod(const recomp_precompiled_mod& code) {
++    std::lock_guard<std::mutex> lock(mod_context_mutex);
++    mod_context->register_precompiled_mod(code);
++}
++
+ void recomp::mods::register_deprecated_mod(const std::string& mod_id, recomp::mods::DeprecationStatus deprecation_status, const Version& maximum_version) {
+     std::lock_guard<std::mutex> lock(mod_context_mutex);
+     mod_context->register_deprecated_mod(mod_id, deprecation_status, maximum_version);
+@@ -169,6 +183,29 @@ bool check_hash(const std::vector<uint8_t>& rom_data, uint64_t expected_hash) {
+ static std::vector<uint8_t> read_file(const std::filesystem::path& path) {
+     std::vector<uint8_t> ret;
+ 
++#ifdef __EMSCRIPTEN__
++    // A page's files are in the page's thread's file system, and every read from another thread waits for that thread:
++    // an ifstream reads a ROM there 1 KB at a time, 65,536 round trips for a 64 MB one (0.5 s in Chrome), and the
++    // launcher, which loads the ROM, draws nothing meanwhile. So it is read in 4 MB pieces, a millisecond or two each.
++    int fd = open(path.c_str(), O_RDONLY);
++    struct stat st;
++    if (fd >= 0 && fstat(fd, &st) == 0) {
++        ret.resize(st.st_size);
++        size_t done = 0;
++        while (done < ret.size()) {
++            ssize_t got = read(fd, ret.data() + done, std::min<size_t>(ret.size() - done, 4 << 20));
++            if (got <= 0) {
++                break;
++            }
++            done += got;
++        }
++        ret.resize(done);
++    }
++    if (fd >= 0) {
++        close(fd);
++    }
++    return ret;
++#else
+     std::ifstream file{ path, std::ios::binary};
+ 
+     if (file.good()) {
+@@ -180,9 +217,31 @@ static std::vector<uint8_t> read_file(const std::filesystem::path& path) {
+     }
+ 
+     return ret;
++#endif
+ }
+ 
+ bool write_file(const std::filesystem::path& path, const std::vector<uint8_t>& data) {
++#ifdef __EMSCRIPTEN__
++    // A page stores the ROM Load ROM picked on a thread of its own (RecompFrontend's picker), so the launcher's thread
++    // can check the stored ROMs while it is being written, and check_stored_rom deletes a stored ROM whose hash is wrong,
++    // a half-written one too: the rest went to a deleted file, select_rom still said Good, and Start Game then found no
++    // ROM. So it is written beside the stored one and renamed over it whole.
++    std::filesystem::path temp_path = path;
++    temp_path += ".temp";
++    {
++        std::ofstream out_file{ temp_path, std::ios::binary };
++        if (!out_file.good()) {
++            return false;
++        }
++        out_file.write(reinterpret_cast<const char*>(data.data()), data.size());
++        if (!out_file.good()) {
++            return false;
++        }
++    }
++    std::error_code ec;
++    std::filesystem::rename(temp_path, path, ec);
++    return !ec;
++#else
+     std::ofstream out_file{ path, std::ios::binary };
+ 
+     if (!out_file.good()) {
+@@ -192,6 +251,7 @@ bool write_file(const std::filesystem::path& path, const std::vector<uint8_t>& d
+     out_file.write(reinterpret_cast<const char*>(data.data()), data.size());
+ 
+     return true;
++#endif
+ }
+ 
+ bool check_stored_rom(const recomp::GameEntry& game_entry) {
+@@ -442,13 +502,9 @@ extern "C" void cop0_status_write(recomp_context* ctx, gpr value) {
+         changed &= ~(uint32_t)StatusReg::FR;
+     }
+ 
+-    // If any other bits were changed, assert false as they're not handled currently
+-    if (changed) {
+-        printf("Unhandled status register bits changed: 0x%08X\n", changed);
+-        assert(false);
+-        exit(EXIT_FAILURE);
+-    }
+-    
++    // The other bits (the interrupt mask, CU0-CU3, KSU, EXL, ERL) change nothing for recompiled code, which takes no
++    // interrupts or exceptions and always has its FPU: they're stored for cop0_status_read, as the CPU keeps them.
++
+     // Update the status register in the context
+     ctx->status_reg = new_sr;
+ }
+@@ -517,7 +573,7 @@ void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
+     //constexpr int32_t osVersion = 0x80000314;
+     constexpr int32_t osMemSize = 0x80000318;
+     //constexpr int32_t osAppNMIBuffer = 0x8000031c;
+-    MEM_W(osTvType, 0) = 1; // NTSC
++    MEM_W(osTvType, 0) = 0; // PAL for the European 40 Winks prototype
+     MEM_W(osRomBase, 0) = 0xB0000000u; // standard rom base
+     MEM_W(osResetType, 0) = 0; // cold reset
+     MEM_W(osMemSize, 0) = 8 * 1024 * 1024; // 8MB
+@@ -707,6 +763,16 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+             {
+                 if (!recomp::load_stored_rom(current_game.value())) {
+                     ultramodern::error_handling::message_box("Error opening stored ROM! Please restart this program.");
++#ifdef __EMSCRIPTEN__
++                    // The game went on with no ROM and a page trapped out of bounds on a worker, its last word, so it
++                    // goes back to the launcher instead, as when its mods don't load. Only with no ROM at all: a recomp
++                    // that keeps no stored ROM hands the runtime the ROM's bytes itself (set_rom_contents) before it
++                    // starts the game, finds no stored one every time, and goes on with the ROM it gave.
++                    if (!recomp::is_rom_loaded()) {
++                        game_status.store(GameStatus::None);
++                        return false;
++                    }
++#endif
+                 }
+ 
+                 auto find_it = game_roms.find(current_game.value());
+@@ -753,6 +819,16 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+                 save_type = game_entry.save_type;
+                 ultramodern::init_saving(rdram);
+ 
++#ifdef __EMSCRIPTEN__
++                // What the renderer must build before the game draws (RT64's prebuilt shaders for the game's boot, where
++                // the browser builds pipelines in line with its other GPU work) is built now, before the game's first
++                // sound, which the same wait at its first frames cut short for 0.1-11.7 s in Firefox.
++                ultramodern::renderer::prepare_for_game();
++
++                // Tells the page its game is running, past the launcher: the shell's on-screen controller shows from here.
++                MAIN_THREAD_ASYNC_EM_ASM({ if (Module.gameStarted) Module.gameStarted(); });
++#endif
++
+                 try {
+                     game_entry.entrypoint(rdram, context);
+                 } catch (ultramodern::thread_terminated& terminated) {
+@@ -936,12 +1012,13 @@ void recomp::start(const recomp::Configuration& cfg) {
+     uint8_t* rdram;
+     bool alloc_failed;
+ #ifdef _WIN32
+-    rdram = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocation_size, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS));
+-    DWORD old_protect = 0;
++    // Reserve the whole range and commit only the memory size: committed pages count against Windows' commit limit
++    // even when they can't be accessed, and reserved ones fault on access just the same.
++    rdram = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocation_size, MEM_RESERVE, PAGE_NOACCESS));
+     alloc_failed = (rdram == nullptr);
+     if (!alloc_failed) {
+-        // VirtualProtect returns 0 on failure.
+-        alloc_failed = (VirtualProtect(rdram, mem_size, PAGE_READWRITE, &old_protect) == 0);
++        // VirtualAlloc returns nullptr on failure.
++        alloc_failed = (VirtualAlloc(rdram, mem_size, MEM_COMMIT, PAGE_READWRITE) == nullptr);
+         if (alloc_failed) {
+             VirtualFree(rdram, 0, MEM_RELEASE);
+         }
+diff --git a/librecomp/src/sp.cpp b/librecomp/src/sp.cpp
+index ae0f44f..7eff56f 100644
+--- a/librecomp/src/sp.cpp
++++ b/librecomp/src/sp.cpp
+@@ -14,6 +14,8 @@ extern "C" void osSpTaskStartGo_recomp(uint8_t* rdram, recomp_context* ctx) {
+     OSTask* task = TO_PTR(OSTask, ctx->r4);
+     if (task->t.type == M_GFXTASK) {
+         //printf("[sp] Gfx task: %08X\n", (uint32_t)ctx->r4);
++        // Counted for the loads from ROM that wait for the renderer to read it (ultramodern's displaylists.cpp).
++        ultramodern::displaylist_sent();
+     } else if (task->t.type == M_AUDTASK) {
+         //printf("[sp] Audio task: %08X\n", (uint32_t)ctx->r4);
+     }
+@@ -33,11 +35,15 @@ extern "C" void osSpTaskStartGo_recomp(uint8_t* rdram, recomp_context* ctx) {
+         dump_file.write(ram_unswapped.get(), ram_size);
+         dump_frame = false;
+     }
++    // Copied as it starts, where ultramodern runs an RSP task from a copy (its rsp.hpp)
++    ultramodern::rsp::task_submitted(rdram, ctx->r4);
+     ultramodern::submit_rsp_task(rdram, ctx->r4);
+ }
+ 
+ extern "C" void osSpTaskYield_recomp(uint8_t* rdram, recomp_context* ctx) {
+     // Ignore yield requests (acts as if the task completed before it received the yield request)
++    // A graphics task still waiting for the renderer gets its RSP done now (ultramodern's rsp.cpp, rsp::yield_asked).
++    ultramodern::rsp::yield_asked();
+ }
+ 
+ extern "C" void osSpTaskYielded_recomp(uint8_t* rdram, recomp_context* ctx) {
+diff --git a/ultramodern/CMakeLists.txt b/ultramodern/CMakeLists.txt
+index 5593172..a8767a7 100644
+--- a/ultramodern/CMakeLists.txt
++++ b/ultramodern/CMakeLists.txt
+@@ -39,3 +39,52 @@ target_compile_options(ultramodern PRIVATE
+ if (WIN32)
+     add_compile_definitions(NOMINMAX)
+ endif()
++
++# osStopThread on another thread, and osStartThread on a thread stopped while it waited on a message queue, as libultra
++# does them (threads.cpp); without it, stopping another thread asserts.
++option(ULTRAMODERN_LIBULTRA_THREAD_STOP "osStopThread/osStartThread on another thread as libultra does them (always on with Emscripten)" OFF)
++if (ULTRAMODERN_LIBULTRA_THREAD_STOP OR EMSCRIPTEN)
++    target_compile_definitions(ultramodern PRIVATE ULTRAMODERN_LIBULTRA_THREAD_STOP=1)
++endif()
++
++# An external message whose queue is full and that is to be sent again waits in a list of its own, tried again first at
++# the next OS call or idle wait, instead of going back into the queue the idle thread spins on (mesgqueue.cpp).
++option(ULTRAMODERN_HOLD_BLOCKED_MESSAGES "A blocked external message held in a list, not requeued (always on with Emscripten)" OFF)
++if (ULTRAMODERN_HOLD_BLOCKED_MESSAGES OR EMSCRIPTEN)
++    target_compile_definitions(ultramodern PRIVATE ULTRAMODERN_HOLD_BLOCKED_MESSAGES=1)
++endif()
++
++# An RSP task other than graphics runs from a copy of its OSTask and its data, taken as the game submits it
++# (src/rsp.cpp, task_submitted).
++option(ULTRAMODERN_RSP_TASKS_COPIED "An RSP task other than graphics runs from a copy of what the game submitted (always on with Emscripten)" OFF)
++if (ULTRAMODERN_RSP_TASKS_COPIED OR EMSCRIPTEN)
++    target_compile_definitions(ultramodern PRIVATE ULTRAMODERN_RSP_TASKS_COPIED=1)
++endif()
++
++# A load from ROM onto display list commands the renderer may not have read yet waits until it has (src/displaylists.cpp).
++target_sources(ultramodern PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/displaylists.cpp")
++option(ULTRAMODERN_LOADS_WAIT_FOR_DISPLAY_LISTS "A load from ROM onto display list commands the renderer may not have read yet waits for it (always on with Emscripten)" OFF)
++if (ULTRAMODERN_LOADS_WAIT_FOR_DISPLAY_LISTS OR EMSCRIPTEN)
++    target_compile_definitions(ultramodern PRIVATE ULTRAMODERN_LOADS_WAIT_FOR_DISPLAY_LISTS=1)
++endif()
++
++# The VI thread queues a VI's screen update after it swaps in the framebuffer the game gave it, not before
++# (src/events.cpp, vi_thread_func).
++option(ULTRAMODERN_SCREEN_UPDATE_AFTER_VI "A VI's screen update queued after its framebuffer swap (always on with Emscripten)" OFF)
++if (ULTRAMODERN_SCREEN_UPDATE_AFTER_VI OR EMSCRIPTEN)
++    target_compile_definitions(ultramodern PRIVATE ULTRAMODERN_SCREEN_UPDATE_AFTER_VI=1)
++endif()
++
++# A yield the game asks of a graphics task the renderer hasn't started sends the task's RSP done at once, as the console's
++# RSP would answer it (src/rsp.cpp, rsp::yield_asked).
++option(ULTRAMODERN_YIELDS_END_QUEUED_GRAPHICS "A yield asked of a graphics task not yet started sends its RSP done at once (always on with Emscripten)" OFF)
++if (ULTRAMODERN_YIELDS_END_QUEUED_GRAPHICS OR EMSCRIPTEN)
++    target_compile_definitions(ultramodern PRIVATE ULTRAMODERN_YIELDS_END_QUEUED_GRAPHICS=1)
++endif()
++
++# No VI comes while the graphics thread has spent over two VIs (30 ms) on one action, so a game can't step its logic
++# past a list the renderer is still reading (src/events.cpp, renderer_stalled).
++option(ULTRAMODERN_VIS_WAIT_FOR_RENDERER "No VI while the renderer is stalled in one action (always on with Emscripten)" OFF)
++if (ULTRAMODERN_VIS_WAIT_FOR_RENDERER OR EMSCRIPTEN)
++    target_compile_definitions(ultramodern PRIVATE ULTRAMODERN_VIS_WAIT_FOR_RENDERER=1)
++endif()
+diff --git a/ultramodern/include/ultramodern/config.hpp b/ultramodern/include/ultramodern/config.hpp
+index d190f31..11b974f 100644
+--- a/ultramodern/include/ultramodern/config.hpp
++++ b/ultramodern/include/ultramodern/config.hpp
+@@ -12,11 +12,15 @@ namespace ultramodern {
+             Original,
+             Original2x,
+             Auto,
++            FullHD,
++            WQHD,
++            UHD,
+             OptionCount
+         };
+         enum class WindowMode {
+             Windowed,
+             Fullscreen,
++            BorderlessFullscreen,
+             OptionCount
+         };
+         enum class HUDRatioMode {
+@@ -86,18 +90,22 @@ namespace ultramodern {
+             auto operator<=>(const GraphicsConfig& rhs) const = default;
+         };
+ 
+-        const GraphicsConfig& get_graphics_config();
++        GraphicsConfig get_graphics_config();
+         void set_graphics_config(const GraphicsConfig& new_config);
+ 
+         NLOHMANN_JSON_SERIALIZE_ENUM(ultramodern::renderer::Resolution, {
+             {ultramodern::renderer::Resolution::Original, "Original"},
+             {ultramodern::renderer::Resolution::Original2x, "Original2x"},
+             {ultramodern::renderer::Resolution::Auto, "Auto"},
++            {ultramodern::renderer::Resolution::FullHD, "1080p"},
++            {ultramodern::renderer::Resolution::WQHD, "1440p"},
++            {ultramodern::renderer::Resolution::UHD, "2160p"},
+         });
+ 
+         NLOHMANN_JSON_SERIALIZE_ENUM(ultramodern::renderer::WindowMode, {
+             {ultramodern::renderer::WindowMode::Windowed, "Windowed"},
+-            {ultramodern::renderer::WindowMode::Fullscreen, "Fullscreen"}
++            {ultramodern::renderer::WindowMode::Fullscreen, "Fullscreen"},
++            {ultramodern::renderer::WindowMode::BorderlessFullscreen, "BorderlessFullscreen"}
+         });
+ 
+         NLOHMANN_JSON_SERIALIZE_ENUM(ultramodern::renderer::HUDRatioMode, {
+diff --git a/ultramodern/include/ultramodern/displaylists.hpp b/ultramodern/include/ultramodern/displaylists.hpp
+new file mode 100644
+index 0000000..fd0af15
+--- /dev/null
++++ b/ultramodern/include/ultramodern/displaylists.hpp
+@@ -0,0 +1,23 @@
++#ifndef __ULTRAMODERN_DISPLAYLISTS_HPP__
++#define __ULTRAMODERN_DISPLAYLISTS_HPP__
++
++#include <atomic>
++#include <cstdint>
++
++// With ULTRAMODERN_LOADS_WAIT_FOR_DISPLAY_LISTS (on with Emscripten; displaylists.cpp says why), a load from ROM onto
++// commands of a display list the renderer hasn't read yet waits until it has. Without it these do nothing.
++namespace ultramodern {
++    // Where the renderer marks the RDRAM it reads display list commands from: [0] the lists read in full (counted by
++    // displaylist_read), [1 + physical address / 256] the number of the last list that read a command from those 256
++    // bytes of RDRAM's first 8 MB ([0] + 1 while it is read). nullptr without the option.
++    std::atomic<uint32_t>* displaylist_reads();
++    // A graphics task sent to the renderer.
++    void displaylist_sent();
++    // The renderer has read the oldest list sent to it.
++    void displaylist_read();
++    // Waits, at most 2 s, until the renderer has read every list sent so far if a load to RDRAM at this physical
++    // address and size would land on commands of one of the last lists it read.
++    void wait_for_displaylists_read(uint32_t rdram_address, uint32_t size);
++}
++
++#endif
+diff --git a/ultramodern/include/ultramodern/renderer_context.hpp b/ultramodern/include/ultramodern/renderer_context.hpp
+index d60c4ec..367baa9 100644
+--- a/ultramodern/include/ultramodern/renderer_context.hpp
++++ b/ultramodern/include/ultramodern/renderer_context.hpp
+@@ -54,7 +54,7 @@ namespace ultramodern {
+             auto operator<=>(const WindowHandle&) const = default;
+         };
+ // TODO add a native window handle option here (Display/Window for x11 and ANativeWindow for Android) as a compile-time option.
+-#elif defined(__linux__) || defined(__ANDROID__)
++#elif defined(__linux__) || defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+         using WindowHandle = SDL_Window*;
+ #elif defined(__APPLE__)
+         struct WindowHandle {
+@@ -89,6 +89,10 @@ namespace ultramodern {
+                 virtual void shutdown() = 0;
+                 virtual uint32_t get_display_framerate() const = 0;
+                 virtual float get_resolution_scale() const = 0;
++                // Called on the graphics thread before the game's code first runs, with Emscripten (prepare_for_game()):
++                // what the renderer has to build before the game draws is built here, where it holds up nothing the
++                // player hears, rather than at the game's first frames, where the game waits with its sound started.
++                virtual void prepare_for_game() {}
+ 
+             protected:
+                 SetupResult setup_result;
+@@ -114,6 +118,21 @@ namespace ultramodern {
+ 
+         void set_callbacks(const callbacks_t& callbacks);
+ 
++        // Tells the game the RDP has finished the graphics task the renderer is being sent (RendererContext::send_dl)
++        // before send_dl returns, once the renderer reads nothing more of RDRAM for it, so the game goes on while the
++        // renderer finishes its own work for the task. Only from inside send_dl, on the graphics thread: the DP's message
++        // is then not sent again when send_dl returns.
++        void rdp_done();
++        // Whether rdp_done sent the DP's message of the task send_dl was given, which it then forgets.
++        bool take_rdp_done();
++        // Whether rdp_done has sent the DP's message of the task the graphics thread is in, so the renderer reads nothing
++        // more of RDRAM for it. From any thread.
++        bool rdp_done_pending();
++
++        // Has the graphics thread run RendererContext::prepare_for_game and waits for it: from the game's thread, before
++        // its entrypoint (librecomp's wait_for_game_started()).
++        void prepare_for_game();
++
+         std::unique_ptr<RendererContext> create_render_context(uint8_t* rdram, WindowHandle window_handle, bool developer_mode);
+ 
+         std::string get_graphics_api_name(GraphicsApi api);
+diff --git a/ultramodern/include/ultramodern/rsp.hpp b/ultramodern/include/ultramodern/rsp.hpp
+index dda1b08..610483d 100644
+--- a/ultramodern/include/ultramodern/rsp.hpp
++++ b/ultramodern/include/ultramodern/rsp.hpp
+@@ -23,6 +23,29 @@ namespace ultramodern {
+ 
+         void set_callbacks(const callbacks_t& callbacks);
+ 
++        // Where ULTRAMODERN_RSP_TASKS_COPIED is on, copies an RSP task other than graphics, its OSTask and data, as the
++        // game starts it (librecomp's osSpTaskStartGo), and run_task runs the task from the copy (rsp.cpp says why).
++        void task_submitted(RDRAM_ARG PTR(OSTask) task);
++
++        // The game asked the RSP's task to yield (librecomp's osSpTaskYield). Where
++        // ULTRAMODERN_YIELDS_END_QUEUED_GRAPHICS is on, a graphics task the renderer hasn't started gets its RSP done
++        // now (rsp.cpp says why); otherwise nothing.
++        void yield_asked();
++
++        // Whether the graphics task the renderer takes still needs its RSP done sent (false where yield_asked sent it
++        // already), counting it as sent. Always true where ULTRAMODERN_YIELDS_END_QUEUED_GRAPHICS is off.
++        bool graphics_sp_due();
++
++        // The data of the task the RSP is running (its OSTask's data_ptr and data_size) as the game submitted it, where
++        // the task runs from a copy (task_submitted): an RSP DMA from RDRAM reads the copy wherever it covers and a DMA
++        // to RDRAM writes it too (librecomp's rsp.hpp). Its size is 0 otherwise.
++        struct SubmittedData {
++            uint32_t address; // physical, a multiple of 8
++            uint32_t size; // a multiple of 8
++            uint8_t* bytes; // laid out as RDRAM holds them
++        };
++        extern SubmittedData submitted_data;
++
+         void init();
+         bool run_task(RDRAM_ARG const OSTask* task);
+     };
+diff --git a/ultramodern/include/ultramodern/ultra64.h b/ultramodern/include/ultramodern/ultra64.h
+index 31eb106..05ea2ad 100644
+--- a/ultramodern/include/ultramodern/ultra64.h
++++ b/ultramodern/include/ultramodern/ultra64.h
+@@ -39,7 +39,16 @@ typedef uint8_t u8;
+ #  define RDRAM_ARG1 uint8_t *rdram
+ #  define PASS_RDRAM rdram, 
+ #  define PASS_RDRAM1 rdram
+-#  define TO_PTR(type, var) ((type*)(&rdram[(uint64_t)var - 0xFFFFFFFF80000000]))
++#  if defined(__wasm__) && defined(RECOMP_KUSEG_WINDOW)
++// KUSEG's first 16 MB in the window librecomp allocates right after kseg0's 512 MB, as N64Recomp's recomp.h maps the
++// recompiled code's loads and stores (it says why), and a KUSEG address past it wrapped inside it.
++static inline uint32_t ultramodern_rdram_offset(uint32_t a) {
++    return (a & 0x80000000u) ? a - 0x80000000u : 0x20000000u + (a & 0x00FFFFFFu);
++}
++#    define TO_PTR(type, var) ((type*)(&rdram[ultramodern_rdram_offset((uint32_t)(var))]))
++#  else
++#    define TO_PTR(type, var) ((type*)(&rdram[(uint64_t)var - 0xFFFFFFFF80000000]))
++#  endif
+ #  define GET_MEMBER(type, addr, member) (addr + (intptr_t)&(((type*)nullptr)->member))
+ #  ifdef __cplusplus
+ #    define NULLPTR (PTR(void))0
+@@ -103,6 +112,11 @@ typedef struct OSThread_t {
+     uint16_t state;
+     OSId id;
+     int32_t pad3;
++#if UINTPTR_MAX == UINT32_MAX
++    // libultra's thprof, which a game may write (Banjo-Tooie does, creating its threads). A 64-bit host's pointer is
++    // aligned past it; a 32-bit one's (wasm) would sit here without this.
++    int32_t pad4;
++#endif
+     UltraThreadContext* context; // An actual pointer regardless of platform
+     int32_t sp;
+ } OSThread;
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index 46aea61..da24a61 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -2,6 +2,7 @@
+ #define __ultramodern_HPP__
+ 
+ #include <thread>
++#include "ultramodern/displaylists.hpp"
+ #include <cassert>
+ #include <stdexcept>
+ #include <span>
+diff --git a/ultramodern/src/audio.cpp b/ultramodern/src/audio.cpp
+index a9c37d8..c06b672 100644
+--- a/ultramodern/src/audio.cpp
++++ b/ultramodern/src/audio.cpp
+@@ -1,6 +1,7 @@
+ #include "ultramodern/ultra64.h"
+ #include "ultramodern/ultramodern.hpp"
+ #include <cassert>
++#include <cstdio>
+ 
+ static uint32_t sample_rate = 48000;
+ 
+@@ -26,6 +27,20 @@ void ultramodern::queue_audio_buffer(RDRAM_ARG PTR(int16_t) audio_data_, uint32_
+     // Ensure that the byte count is an integer multiple of samples.
+     assert((byte_count & 1) == 0);
+ 
++    // A game may give its buffer's uncached address (KSEG1, from 0xA0000000), which TO_PTR would put 512 MB past
++    // RDRAM: it's read through the cached one (KSEG0) for the same memory. A buffer that doesn't lie in RDRAM's 8 MB
++    // isn't played, as reading it would read past RDRAM (into another allocation on a page, which has no guard region).
++    const uint32_t rdram_address = uint32_t(audio_data_) & 0x1FFFFFFF;
++    if ((uint32_t(audio_data_) & 0xC0000000) != 0x80000000 || rdram_address > 0x800000 || byte_count > 0x800000 - rdram_address) {
++        static bool reported = false;
++        if (!reported) {
++            reported = true;
++            fprintf(stderr, "ultramodern: a sound buffer outside RDRAM (0x%08X, %u bytes) isn't played\n", uint32_t(audio_data_), byte_count);
++        }
++        return;
++    }
++    audio_data_ = PTR(int16_t)(rdram_address | 0x80000000);
++
+     // Calculate the number of samples from the number of bytes.
+     uint32_t sample_count = byte_count / sizeof(int16_t);
+ 
+diff --git a/ultramodern/src/displaylists.cpp b/ultramodern/src/displaylists.cpp
+new file mode 100644
+index 0000000..be6c588
+--- /dev/null
++++ b/ultramodern/src/displaylists.cpp
+@@ -0,0 +1,90 @@
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <thread>
++
++#include "ultramodern/displaylists.hpp"
++
++// On a console the RSP reads a display list within a few ms of the game sending it, long before the game's next load
++// from ROM lands, so a game may load over commands its last list runs: one loads its title screen's textures over its
++// logos' model the frame after their last list. Here the renderer reads a list on the graphics thread, which on a slow
++// GPU can be a frame or more behind the game, and would take what the load left there for commands. So the renderer
++// marks in displaylist_reads() the RDRAM it reads each list's commands from (RT64's interpreter, given the array by
++// RecompFrontend's glue, which counts the lists read), librecomp counts the graphics tasks sent, and a load from ROM
++// onto commands one of the last lists read ran waits until the renderer has read every list sent before it, on
++// whichever thread the load is (the one that loads over a list needn't be the one that sends it). A load anywhere else,
++// as a sound's samples, goes at once.
++
++#if ULTRAMODERN_LOADS_WAIT_FOR_DISPLAY_LISTS
++
++namespace {
++    // RDRAM's 8 MB in 256-byte units.
++    constexpr uint32_t unit_shift = 8;
++    constexpr uint32_t units = 0x800000 >> unit_shift;
++
++    // Commands one of the last this many lists the renderer read ran are ones the lists it hasn't read yet may run.
++    constexpr uint32_t recent_lists = 8;
++
++    // [0] the lists the renderer has read in full; [1 + unit] the number of the last list it read commands from there
++    // in (counting from 1, so 0 is none; displaylists.hpp).
++    std::atomic<uint32_t> reads[1 + units];
++    std::atomic<uint32_t> lists_sent{ 0 };
++}
++
++std::atomic<uint32_t>* ultramodern::displaylist_reads() {
++    return reads;
++}
++
++void ultramodern::displaylist_sent() {
++    lists_sent.fetch_add(1, std::memory_order_relaxed);
++}
++
++void ultramodern::displaylist_read() {
++    reads[0].fetch_add(1, std::memory_order_release);
++}
++
++void ultramodern::wait_for_displaylists_read(uint32_t rdram_address, uint32_t size) {
++    uint32_t sent = lists_sent.load(std::memory_order_relaxed);
++    uint32_t read = reads[0].load(std::memory_order_acquire);
++    uint32_t first = rdram_address >> unit_shift;
++    if (read >= sent || size == 0 || first >= units) {
++        return;
++    }
++
++    uint32_t last = std::min((rdram_address + size - 1) >> unit_shift, units - 1);
++    bool over_commands = false;
++    for (uint32_t unit = first; unit <= last && !over_commands; unit++) {
++        uint32_t list = reads[1 + unit].load(std::memory_order_relaxed);
++        over_commands = (list != 0) && (list + recent_lists > read);
++    }
++
++    if (!over_commands) {
++        return;
++    }
++
++    // At most 2 s, after which the lists still unread count as read, so a renderer that stopped reading them (or reads
++    // fewer than are sent) costs one wait, not one per load.
++    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
++    while (reads[0].load(std::memory_order_acquire) < sent) {
++        if (std::chrono::steady_clock::now() >= deadline) {
++            lists_sent.store(reads[0].load(std::memory_order_acquire), std::memory_order_relaxed);
++            return;
++        }
++
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++}
++
++#else
++
++std::atomic<uint32_t>* ultramodern::displaylist_reads() {
++    return nullptr;
++}
++
++void ultramodern::displaylist_sent() {}
++
++void ultramodern::displaylist_read() {}
++
++void ultramodern::wait_for_displaylists_read(uint32_t, uint32_t) {}
++
++#endif
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 43034f0..926a645 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -39,7 +39,11 @@ struct DummyWorkloadAction {
+     int32_t fb_address;
+ };
+ 
+-using Action = std::variant<SpTaskAction, ScreenUpdateAction, UpdateConfigAction, DummyWorkloadAction>;
++struct PrepareForGameAction {
++    moodycamel::LightweightSemaphore* done;
++};
++
++using Action = std::variant<SpTaskAction, ScreenUpdateAction, UpdateConfigAction, DummyWorkloadAction, PrepareForGameAction>;
+ 
+ struct ViState {
+     const OSViMode* mode = nullptr;
+@@ -54,6 +58,24 @@ struct ViState {
+ #define VI_STATE_BLACK 0x20
+ #define VI_STATE_REPEATLINE 0x40
+ 
++// The graphics thread's actions, taken in the order they were queued, whichever thread queued them. A moodycamel queue
++// keeps one thread's order only: each thread queues into a list of its own, and a dequeue takes from the list that
++// holds the most. The VI thread queues its ScreenUpdateAction for the framebuffer it showed before it moves on to the
++// next one, and a game then draws its next frame into that framebuffer: its graphics task could run first, and the
++// screen showed the framebuffer with the next frame's first lists drawn into it (Mario Party 1's flash of a new scene
++// before its star wipe opens, 9 presents in 12,225 on a busy host). Every thread queues through one producer token.
++struct ActionQueue : moodycamel::BlockingConcurrentQueue<Action> {
++    moodycamel::ProducerToken token{ *this };
++    std::mutex mutex;
++
++    ActionQueue() {}
++
++    bool enqueue(Action action) {
++        std::lock_guard lock{ mutex };
++        return BlockingConcurrentQueue::enqueue(token, std::move(action));
++    }
++};
++
+ static struct {
+     struct {
+         std::thread thread;
+@@ -137,7 +159,7 @@ static struct {
+     // The same message queue may be used for multiple events, so share a mutex for all of them
+     std::mutex message_mutex;
+     uint8_t* rdram;
+-    moodycamel::BlockingConcurrentQueue<Action> action_queue{};
++    ActionQueue action_queue{};
+     moodycamel::BlockingConcurrentQueue<OSTask*> sp_task_queue{};
+     moodycamel::ConcurrentQueue<OSThread*> deleted_threads{};
+ } events_context{};
+@@ -180,6 +202,195 @@ uint64_t total_vis = 0;
+ 
+ 
+ extern std::atomic_bool exited;
++
++#if defined(__EMSCRIPTEN_PTHREADS__)
++#include <algorithm>
++#include <cerrno>
++#include <climits>
++#include <cstdio>
++#include <emscripten/emscripten.h>
++#include <emscripten/html5.h>
++#include <emscripten/proxying.h>
++#include <emscripten/threading.h>
++
++// On a page the VI thread's timed sleep can end long after the VI's time: in Firefox on Windows every timed wait off the
++// page's thread ends on the system timer's tick (15.6 ms unless the browser's process asks for a finer one), so VIs came
++// 15.6 or 31.2 ms apart instead of 16.7. RT64 reads a game's rate from how many VIs each of its frames was shown for,
++// and from those it read GoldenEye, a new frame at nearly every VI, as a game at 30 about 5 times a second, made two
++// presents of each of those frames, and presented 63-64 a second on a 60 Hz display. So where a timed wait ends late,
++// the VI thread waits for the browser's animation frames, whose futex wake comes at once, and a VI comes at the first
++// frame less than half a VI before its time: on a 60 Hz display every VI is a frame apart. A timed wait to the VI's time
++// stays as the fallback, for a page whose frames have stopped (hidden). Elsewhere (Chrome, a finer timer) the VI thread
++// sleeps as before.
++// It sits up here, apart from vi_thread_func, because a recomp's own patch to the VI thread adds its state just above
++// that function (CBFD-Recompiled's remaining_retraces), and a block there kept such a patch from applying.
++namespace {
++    // Whether a timed wait off the page's thread ends late, judged as plume's timedWaitsEndLate() judges it: first three
++    // waits of 100 us, late if the shortest took more than 4 ms, then while that judged them on time the VI thread's own
++    // (vi_wait_ended()). A page's waits can turn as it plays: in Firefox 158 on a desktop the same page's ended 140 ms past
++    // their time in its launcher and 0.1 ms past it once its game ran, or stayed late all through.
++    bool vi_late = false;
++
++    bool vi_waits_end_late() {
++        [[maybe_unused]] static const bool measured = []() {
++            uint32_t futex = 0;
++            double shortest = 1e9;
++            for (int i = 0; i < 3; i++) {
++                const double start = emscripten_get_now();
++                emscripten_futex_wait(&futex, 0, 0.1);
++                shortest = std::min(shortest, emscripten_get_now() - start);
++            }
++
++            vi_late = shortest > 4.0;
++            return true;
++        }();
++
++        return vi_late;
++    }
++
++    // A timed wait of the VI thread's that ended over_ms past its time: waits judged on time turn late once most of those
++    // in each of 10 seconds in a row ended more than 4 ms past their time, and stay late, as plume's timedWaitEnded()
++    // judges the present thread's.
++    void vi_wait_ended(double over_ms) {
++        static double second_start = 0.0;
++        static uint32_t second_waits = 0;
++        static uint32_t second_late_waits = 0;
++        static uint32_t late_seconds = 0;
++        const double now = emscripten_get_now();
++        if (second_start == 0.0) {
++            second_start = now;
++        }
++
++        second_waits++;
++        second_late_waits += (over_ms > 4.0) ? 1 : 0;
++        if ((now - second_start) < 1000.0) {
++            return;
++        }
++
++        late_seconds = ((second_late_waits * 2) > second_waits) ? (late_seconds + 1) : 0;
++        second_start = now;
++        second_waits = 0;
++        second_late_waits = 0;
++        if (late_seconds >= 10) {
++            vi_late = true;
++            fprintf(stderr, "ultramodern: most of the VI thread's timed waits ended over 4 ms late for 10 s, so VIs come on the browser's animation frames from now on\n");
++        }
++    }
++
++    // The browser's animation frames, counted on the page's thread: a futex woken at each. Only the count crosses
++    // threads: the VI thread times a frame by when its wake reaches it, since a time read on the page's thread and one
++    // read on another don't agree in Firefox (each context's own performance.timeOrigin), and comparing them sent VIs
++    // 1,500-1,800 a second. Firefox also calls back 0.1-5 ms after a frame now and then, which isn't a frame of the display.
++    std::atomic<uint32_t> vi_frame_serial{ 0 };
++
++    bool vi_animation_frame(double, void*) {
++        static double last = 0.0;
++        const double now = emscripten_get_now();
++        if ((now - last) >= 5.0) {
++            last = now;
++            vi_frame_serial++;
++            emscripten_futex_wake(&vi_frame_serial, INT_MAX);
++        }
++
++        return true;
++    }
++
++    void vi_start_frames(void*) {
++        emscripten_request_animation_frame_loop(vi_animation_frame, nullptr);
++    }
++
++    // Holds the VI thread until about the given time, ending on the first animation frame to come less than half a VI
++    // before it, or at the time if none comes by then. False where a timed wait ends on time, and the caller sleeps itself.
++    // While timed waits are judged on time it first waits up to 100 us for a frame, no longer than the caller's own sleep
++    // would have taken, and judges that wait if it ended on its time (vi_wait_ended()): a frame's wake says nothing of
++    // the timer.
++    bool vi_sleep_until(const std::chrono::high_resolution_clock::time_point& time_point) {
++        if (!vi_waits_end_late() && ((time_point - std::chrono::high_resolution_clock::now()) > std::chrono::microseconds(500))) {
++            const double start = emscripten_get_now();
++            if (emscripten_futex_wait(&vi_frame_serial, vi_frame_serial, 0.1) == -ETIMEDOUT) {
++                vi_wait_ended(emscripten_get_now() - start - 0.1);
++            }
++        }
++
++        if (!vi_waits_end_late()) {
++            return false;
++        }
++
++        [[maybe_unused]] static const bool started = []() {
++            emscripten_proxy_async(emscripten_proxy_get_system_queue(), emscripten_main_runtime_thread_id(), vi_start_frames, nullptr);
++            fprintf(stderr, "ultramodern: timed waits end late on this page, so VIs come on the browser's animation frames\n");
++            return true;
++        }();
++
++        const double end = emscripten_get_now() + std::chrono::duration<double, std::milli>(time_point - std::chrono::high_resolution_clock::now()).count();
++        const double from = end - 1000.0 / (2 * 60 * ultramodern::get_speed_multiplier());
++        uint32_t serial = vi_frame_serial;
++        for (;;) {
++            const double now = emscripten_get_now();
++            const uint32_t current = vi_frame_serial;
++            if ((now >= end) || ((current != serial) && (now >= from))) {
++                return true;
++            }
++
++            serial = current;
++            emscripten_futex_wait(&vi_frame_serial, serial, end - now);
++        }
++    }
++}
++#endif
++
++#if ULTRAMODERN_VIS_WAIT_FOR_RENDERER
++// The VI thread sends no VI while the graphics thread has spent more than a few VIs on one action. The thread tells the
++// game its RSP task is done before the renderer reads the list (gfx_thread_func), and a console's RSP has read it a few
++// ms later, so a game can step its logic every VI whatever its lists do: Paper Mario's runs before it checks how many
++// tasks are pending, which holds back only its drawing. On a page the renderer's thread can stop for seconds in one
++// list, waiting for a readback while the browser builds pipelines (Firefox builds them in line with the device, 4-10 s
++// for a section of the prebuilt shader list). Paper Mario's attract demo went on to its next map in that time, and the
++// list the renderer was still reading pointed at what the map's load had put there since: a function pointer read
++// 0x00010001 and the page trapped, or it trapped in malloc, or it stopped drawing. Held, the game sees the stall as a
++// console would never show it, one long VI.
++// A stall is two VIs, not six: a page whose every list took about 100 ms left the game six VIs behind each one. In
++// Firefox, its tab hidden on a busy host, Paper Mario's lists took 50-230 ms each (its render to RAM's readbacks waiting
++// on the page's thread), the game stepped its logic three times behind each, and as its intro story handed over to the
++// attract demo it freed what the list in hand pointed at: it trapped in its heap allocator, the free list corrupt, or
++// stopped drawing for good, 4-6 s after the hide in 3 plays of 3. Held after two VIs, as a console's RDP is done with a
++// list a VI or two after it starts, it came through and went on into the demo.
++// Nor once the renderer has told the game the list in hand is done (renderer::rdp_done): it reads nothing more of RDRAM
++// for it, and what is left is its own work, the wait for a busy GPU included. Held there, the game's clock stopped for
++// nothing, and its sound with it, which nothing makes up afterwards: Rush 2049's page in Firefox, uncapped and its tab
++// hidden, held its VIs 91-105 times a play (9.5-11.9 s in all) and its sound ran 238,000-253,000 frames short, most of
++// it through a 5 s wait for a section's prebuilt shaders as its attract race starts; lifted at the RDP's done, it held 4
++// times (only before its sound starts) and lost none.
++// Both sides touch only lines a game fork's own patches to this file leave alone (DKR-R-web's rewrite the VI messages'
++// block and the graphics thread's actions).
++namespace {
++    // The graphics thread's turns of its loop: waiting for an action, it comes round every 1 ms (a timed wait's tick in
++    // Firefox, 15.6 ms). A count, not a time: a time read on one thread and one read on another don't agree on a page
++    // in Firefox (each worker's own performance.timeOrigin), so only the VI thread's own clock times it.
++    std::atomic<uint32_t> renderer_loop_turns{ 0 };
++
++    // Two VIs: a list or screen update takes a few ms. The VI thread looks once a VI, so a game gets two or three VIs of
++    // an action before the hold. Over a timed wait's tick in Firefox (15.6 ms), so an idle thread isn't taken for one.
++    constexpr std::chrono::milliseconds renderer_stall_limit{ 30 };
++
++    // Whether the graphics thread has made no turn for renderer_stall_limit, as the VI thread (its only caller) has seen.
++    // None before its loop's first turn.
++    bool renderer_stalled() {
++        static uint32_t seen_turns = 0;
++        static std::chrono::steady_clock::time_point seen_time{};
++        const uint32_t turns = renderer_loop_turns.load();
++        const auto now = std::chrono::steady_clock::now();
++        if ((turns == 0) || (turns != seen_turns) || ultramodern::renderer::rdp_done_pending()) {
++            seen_turns = turns;
++            seen_time = now;
++            return false;
++        }
++
++        return (now - seen_time) > renderer_stall_limit;
++    }
++}
++#endif
++
+ extern moodycamel::LightweightSemaphore graphics_shutdown_ready;
+ 
+ void set_dummy_vi(bool odd);
+@@ -209,10 +420,31 @@ void vi_thread_func() {
+             // printf("Skipping the next VI wait\n");
+             next = std::chrono::high_resolution_clock::now();
+         }
++#if ULTRAMODERN_VIS_WAIT_FOR_RENDERER
++        // No VI while the graphics thread is stalled in one action (renderer_stalled()); the next comes once it isn't.
++        while (renderer_stalled() && !exited) {
++            std::this_thread::sleep_for(1ms);
++        }
++#endif
++#if defined(__EMSCRIPTEN_PTHREADS__)
++        // A VI that ended on a frame leaves the timed wait below nothing to wait for. That wait stays where it was, so
++        // a recomp's own patches to this loop still apply.
++        const bool vi_on_frame = vi_sleep_until(next);
++        if (vi_on_frame) {
++            next = std::chrono::high_resolution_clock::now();
++        }
++#endif
+         ultramodern::sleep_until(next);
+         auto time_now = ultramodern::time_since_start();
+         // Calculate how many VIs have passed
+         uint64_t new_total_vis = (time_now * (50 * ultramodern::get_speed_multiplier()) / 1000ms) + 1;
++#if defined(__EMSCRIPTEN_PTHREADS__)
++        // A VI that ended on a frame before its time is that VI all the same: counted from the time, it would be the one
++        // before it again, sent a second time at the next frame (VIs came 64-91 a second).
++        if (vi_on_frame) {
++            new_total_vis = std::max(new_total_vis, total_vis + 1);
++        }
++#endif
+         if (new_total_vis > total_vis + 1) {
+             //printf("Skipped % " PRId64 " frames in VI interupt thread!\n", new_total_vis - total_vis - 1);
+         }
+@@ -227,12 +459,20 @@ void vi_thread_func() {
+             events_context.action_queue.enqueue(DummyWorkloadAction{events_context.vi.get_next_state()->framebuffer});
+         }
+ 
++#if ULTRAMODERN_SCREEN_UPDATE_AFTER_VI
++        // The screen update shows the framebuffer this VI swaps in, queued right behind the workloads that drew it and
++        // before the next frame's. Queued before the swap, it showed the one swapped in at the VI before: a VI late, after
++        // the next frame's first workloads, where RT64_GAME_FRAME_WORKLOADS ends a game frame at its framebuffer's present.
++        events_context.vi.update_vi();
++        events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
++#else
+         // Queue a screen update for the graphics thread with the current VI register state.
+         // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
+         events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
+ 
+         // Update VI registers and swap VI modes.
+         events_context.vi.update_vi();
++#endif
+ 
+         // If the game has started, handle sending VI and AI events.
+         if (ultramodern::is_game_started()) {
+@@ -261,12 +501,24 @@ void vi_thread_func() {
+ }
+ 
+ void sp_complete() {
++#if ULTRAMODERN_YIELDS_END_QUEUED_GRAPHICS
++    // A graphics task's RSP done went already if a yield was asked of it while it waited (rsp::yield_asked).
++    if ((std::this_thread::get_id() == events_context.sp.gfx_thread.get_id()) && !ultramodern::rsp::graphics_sp_due()) {
++        return;
++    }
++#endif
++
+     uint8_t* rdram = events_context.rdram;
+     std::lock_guard lock{ events_context.message_mutex };
+     ultramodern::enqueue_external_message_src(events_context.sp.mq, events_context.sp.msg, false, ultramodern::EventMessageSource::Sp);
+ }
+ 
+ void dp_complete() {
++    // Sent already if the renderer sent it before send_dl returned (ultramodern::renderer::rdp_done).
++    if (ultramodern::renderer::take_rdp_done()) {
++        return;
++    }
++
+     uint8_t* rdram = events_context.rdram;
+     std::lock_guard lock{ events_context.message_mutex };
+     ultramodern::enqueue_external_message_src(events_context.dp.mq, events_context.dp.msg, false, ultramodern::EventMessageSource::Dp);
+@@ -302,7 +554,7 @@ std::atomic_uint32_t display_refresh_rate = 60;
+ std::atomic<float> resolution_scale = 1.0f;
+ 
+ uint32_t ultramodern::get_target_framerate(uint32_t original) {
+-    auto& config = ultramodern::renderer::get_graphics_config();
++    const auto config = ultramodern::renderer::get_graphics_config();
+ 
+     switch (config.rr_option) {
+         case ultramodern::renderer::RefreshRate::Original:
+@@ -327,6 +579,15 @@ void ultramodern::trigger_config_action() {
+     events_context.action_queue.enqueue(UpdateConfigAction{});
+ }
+ 
++// The graphics thread takes it after every action queued before it: the launcher's lists and screen updates, all of
++// them the renderer's before the game's. With Emscripten the VI thread sends no VI while the renderer is in it
++// (renderer_stalled()), so the game, its audio interrupts included, starts after it, as if it had started then.
++void ultramodern::renderer::prepare_for_game() {
++    moodycamel::LightweightSemaphore done;
++    events_context.action_queue.enqueue(PrepareForGameAction{ &done });
++    done.wait();
++}
++
+ std::atomic<ultramodern::renderer::SetupResult> renderer_setup_result = ultramodern::renderer::SetupResult::Success;
+ std::atomic<ultramodern::renderer::GraphicsApi> renderer_chosen_api = ultramodern::renderer::GraphicsApi::Auto;
+ 
+@@ -361,6 +622,9 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+     while (!exited) {
+         // Try to pull an action from the queue
+         Action action;
++#if ULTRAMODERN_VIS_WAIT_FOR_RENDERER
++        renderer_loop_turns++;
++#endif
+         if (events_context.action_queue.wait_dequeue_timed(action, 1ms)) {
+             // Determine the action type and act on it
+             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
+@@ -400,6 +664,10 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+             else if (const auto* dummy_workload_action = std::get_if<DummyWorkloadAction>(&action)) {
+                 renderer_context->send_dummy_workload(dummy_workload_action->fb_address);
+             }
++            else if (const auto* prepare_action = std::get_if<PrepareForGameAction>(&action)) {
++                renderer_context->prepare_for_game();
++                prepare_action->done->signal();
++            }
+         }
+     }
+ 
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
+index 9944a02..b7a1a2a 100644
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
+@@ -11,6 +11,14 @@ struct QueuedMessage {
+     OSMesg mesg;
+     bool jam;
+     bool requeue_if_blocked;
++#if ULTRAMODERN_HOLD_BLOCKED_MESSAGES
++    // A blocked external message waits in a list, not in the queue (below wait_for_external_message_timed).
++    static std::vector<QueuedMessage> blocked_messages;
++    static bool send_blocked_messages(RDRAM_ARG1);
++#define REQUEUE_BLOCKED_MESSAGE(mesg) QueuedMessage::blocked_messages.push_back(mesg)
++#else
++#define REQUEUE_BLOCKED_MESSAGE(mesg) external_messages.enqueue(mesg)
++#endif
+ };
+ 
+ static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
+@@ -40,32 +48,71 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
+ void dequeue_external_messages(RDRAM_ARG1) {
+     QueuedMessage to_send;
+     std::vector<QueuedMessage> requeued_messages{};
++#if ULTRAMODERN_HOLD_BLOCKED_MESSAGES
++    QueuedMessage::send_blocked_messages(PASS_RDRAM1);
++#endif
+     while (external_messages.try_dequeue(to_send)) {
+         if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+             requeued_messages.push_back(to_send);
+         }
+     }
+     for (QueuedMessage& cur_mesg : requeued_messages) {
+-        external_messages.enqueue(cur_mesg);
++        REQUEUE_BLOCKED_MESSAGE(cur_mesg);
+     }
+ }
+ 
+ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
+     QueuedMessage to_send;
++#if ULTRAMODERN_HOLD_BLOCKED_MESSAGES
++    if (QueuedMessage::send_blocked_messages(PASS_RDRAM1)) {
++        return;
++    }
++#endif
+     external_messages.wait_dequeue(to_send);
+     if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-        external_messages.enqueue(to_send);
++        REQUEUE_BLOCKED_MESSAGE(to_send);
+     }
+ }
+ 
+ void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
+     QueuedMessage to_send;
++#if ULTRAMODERN_HOLD_BLOCKED_MESSAGES
++    if (QueuedMessage::send_blocked_messages(PASS_RDRAM1)) {
++        return;
++    }
++#endif
+     if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
+         if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-            external_messages.enqueue(to_send);
++            REQUEUE_BLOCKED_MESSAGE(to_send);
++        }
++    }
++}
++
++#if ULTRAMODERN_HOLD_BLOCKED_MESSAGES
++// An external message whose queue is full and that is to be sent again waits here, and is tried again before any other
++// at a game thread's next OS call or the idle thread's next wait. Put back into external_messages, the idle thread
++// (pause_self) took it again at once, since that queue keeps no order between producers: it spun on it, ~12 million
++// times a second, and the messages behind it waited until a game thread's OS call drained the queue, often the
++// scheduler's at the next retrace. Jet Force Gemini leaves a controller (SI) message blocked for good, so with the RSP's
++// completion of a display list sent before the RDP's, each frame's RDP completion waited for a retrace: 4-6 retraces a
++// game frame instead of 2. A slot frees only by a game thread's receive, which an OS call or an idle wait follows, so a
++// message held here is never stranded. Only the game thread that runs touches the list.
++std::vector<QueuedMessage> QueuedMessage::blocked_messages{};
++
++bool QueuedMessage::send_blocked_messages(RDRAM_ARG1) {
++    bool sent_any = false;
++    for (size_t i = 0; i < blocked_messages.size();) {
++        const QueuedMessage& cur_mesg = blocked_messages[i];
++        if (do_send(PASS_RDRAM cur_mesg.mq, cur_mesg.mesg, cur_mesg.jam, false)) {
++            blocked_messages.erase(blocked_messages.begin() + i);
++            sent_any = true;
++        } else {
++            i++;
+         }
+     }
++    return sent_any;
+ }
++#endif
+ 
+ extern "C" void osCreateMesgQueue(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg, s32 count) {
+     OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
+diff --git a/ultramodern/src/renderer_context.cpp b/ultramodern/src/renderer_context.cpp
+index a6af900..cb16fcd 100644
+--- a/ultramodern/src/renderer_context.cpp
++++ b/ultramodern/src/renderer_context.cpp
+@@ -1,4 +1,5 @@
+ #include <cassert>
++#include <atomic>
+ #include <mutex>
+ 
+ #include "ultramodern/renderer_context.hpp"
+@@ -10,6 +11,25 @@ void ultramodern::renderer::set_callbacks(const callbacks_t& callbacks) {
+     render_callbacks = callbacks;
+ }
+ 
++void dp_complete();
++
++// Whether rdp_done sent the DP's message of the graphics task send_dl was given. Only the graphics thread writes it; the
++// VI thread reads it (rdp_done_pending).
++static std::atomic<bool> rdp_done_sent{ false };
++
++void ultramodern::renderer::rdp_done() {
++    dp_complete();
++    rdp_done_sent = true;
++}
++
++bool ultramodern::renderer::take_rdp_done() {
++    return rdp_done_sent.exchange(false);
++}
++
++bool ultramodern::renderer::rdp_done_pending() {
++    return rdp_done_sent.load();
++}
++
+ 
+ std::unique_ptr<ultramodern::renderer::RendererContext> ultramodern::renderer::create_render_context(uint8_t* rdram, WindowHandle window_handle, bool developer_mode) {
+     if (render_callbacks.create_render_context == nullptr) {
+@@ -48,7 +68,7 @@ void ultramodern::renderer::set_graphics_config(const GraphicsConfig& config) {
+     ultramodern::trigger_config_action();
+ }
+ 
+-const ultramodern::renderer::GraphicsConfig& ultramodern::renderer::get_graphics_config() {
++ultramodern::renderer::GraphicsConfig ultramodern::renderer::get_graphics_config() {
+     std::lock_guard<std::mutex> lock(graphic_config_mutex);
+     return graphic_config;
+ }
+diff --git a/ultramodern/src/rsp.cpp b/ultramodern/src/rsp.cpp
+index 1594304..9aff03c 100644
+--- a/ultramodern/src/rsp.cpp
++++ b/ultramodern/src/rsp.cpp
+@@ -3,8 +3,21 @@
+ 
+ #include "ultramodern/rsp.hpp"
+ 
++#if ULTRAMODERN_YIELDS_END_QUEUED_GRAPHICS
++#include <mutex>
++#endif
++
++#if ULTRAMODERN_RSP_TASKS_COPIED
++#include <iterator>
++#include <memory>
++#include <mutex>
++#include <vector>
++#endif
++
+ static ultramodern::rsp::callbacks_t rsp_callbacks {};
+ 
++ultramodern::rsp::SubmittedData ultramodern::rsp::submitted_data {};
++
+ void ultramodern::rsp::set_callbacks(const callbacks_t& callbacks) {
+     rsp_callbacks = callbacks;
+ }
+@@ -15,8 +28,145 @@ void ultramodern::rsp::init() {
+     }
+ }
+ 
++#if ULTRAMODERN_RSP_TASKS_COPIED
++// An RSP task as the game submitted it: its OSTask and the RDRAM its data_ptr and data_size give (an audio task's
++// command list), copied as the game starts it (task_submitted). A task the page runs late would read them after the game
++// had written over them: a game expects its audio task done within the VI it starts in, as the RSP does it, and Super
++// Mario 64's sound thread writes the next list but one into the same buffer and OSTask two VIs after the last, whether
++// the task has run or not. Started late and still reading its list in chunks, the task read the start of one list and
++// the rest of the next, whose commands wrote over aspMain's jump table in DMEM: it exited at an unhandled jump target.
++// With the copy, a task runs on a whole list however late it runs.
++struct SubmittedTask {
++    const OSTask* original;
++    OSTask task;
++    uint32_t data_address;
++    std::vector<uint8_t> data;
++};
++
++// The newest copy for each OSTask the game started a task with, the eight it used last. A task run late takes the
++// newest copy of its OSTask, as it would have read the newest list from RDRAM: one that never runs (a runtime may
++// complete a task unrun) leaves nothing behind, and a task whose copy is gone runs from RDRAM as before.
++static struct {
++    std::mutex mutex;
++    std::shared_ptr<const SubmittedTask> tasks[8];
++    size_t next = 0;
++} submitted_tasks;
++#endif
++
++#if ULTRAMODERN_YIELDS_END_QUEUED_GRAPHICS
++// The graphics thread tells the game its RSP task is done as it takes the task (events.cpp, gfx_thread_func), and ignores
++// a yield, so a task queued behind the renderer's other actions answers no yield until the renderer gets to it. A
++// console's RSP answers one within a few ms, and a game's scheduler may take a yield left unanswered at its next VI for a
++// hung RSP: Beetle Adventure Racing's asks one of the graphics task whenever an audio task comes, and at the next VI
++// sends itself the RSP's and RDP's done. Those end the queued task before the renderer has read it, and the real ones
++// then end the next, so the game took lists for done and reused what they point at: the renderer ran from a list into
++// what the game had put there since, loading vertices until the page ran out of memory, or the scheduler's thread queues
++// broke. On a page with render to RAM's late copy, which tells the game a list is done before the renderer submits it,
++// the next list waits queued that long often enough that the game never got from its menus into a race.
++// So a yield asked while a graphics task waits sends that task's RSP done at once, as if the RSP had finished before
++// the request (what osSpTaskYielded already answers), and the graphics thread sends none as it takes the task. The
++// RDP's done still comes once the renderer has read the list, and a game waits for both before it reuses a list.
++
++// events.cpp's: sends the game the RSP's done.
++void sp_complete();
++
++// Counted together, under the mutex: a graphics task the graphics thread takes either sends its RSP done or finds it
++// sent by yield_asked, never both. A task a game starts without task_submitted (its own osSpTaskStartGo) isn't counted,
++// so a yield asked of it is ignored, as it was.
++static struct {
++    std::mutex mutex;
++    // Graphics tasks started whose RSP done hasn't gone yet.
++    uint32_t owed = 0;
++    // RSP dones yield_asked sent for tasks the graphics thread hasn't taken yet.
++    uint32_t sent_early = 0;
++} graphics_sp;
++
++bool ultramodern::rsp::graphics_sp_due() {
++    std::lock_guard lock{ graphics_sp.mutex };
++    if (graphics_sp.sent_early > 0) {
++        graphics_sp.sent_early--;
++        return false;
++    }
++    if (graphics_sp.owed > 0) {
++        graphics_sp.owed--;
++    }
++
++    return true;
++}
++
++void ultramodern::rsp::yield_asked() {
++    // Sent under the mutex, so the graphics thread can't take the task and send its RDP's done first. sp_complete takes
++    // only the events' message mutex, which the graphics thread doesn't hold as it asks graphics_sp_due.
++    std::lock_guard lock{ graphics_sp.mutex };
++    if (graphics_sp.owed == 0) {
++        return;
++    }
++    graphics_sp.owed--;
++    graphics_sp.sent_early++;
++    sp_complete();
++}
++#else
++bool ultramodern::rsp::graphics_sp_due() {
++    return true;
++}
++
++void ultramodern::rsp::yield_asked() {
++}
++#endif
++
++void ultramodern::rsp::task_submitted(RDRAM_ARG PTR(OSTask) task_) {
++#if ULTRAMODERN_YIELDS_END_QUEUED_GRAPHICS
++    // Counted before the graphics thread can take it (submit_rsp_task comes after)
++    if (TO_PTR(OSTask, task_)->t.type == M_GFXTASK) {
++        std::lock_guard lock{ graphics_sp.mutex };
++        graphics_sp.owed++;
++    }
++#endif
++#if ULTRAMODERN_RSP_TASKS_COPIED
++    const OSTask* task = TO_PTR(OSTask, task_);
++    // A graphics task's OSTask goes to the renderer as a copy already (events.cpp, SpTaskAction)
++    if (task->t.type == M_GFXTASK) {
++        return;
++    }
++    // Its data in whole 8-byte units, as an RSP DMA reads them
++    auto copy = std::make_shared<SubmittedTask>(SubmittedTask{ task, *task, 0, {} });
++    const uint32_t data_start = task->t.data_ptr & 0xFFFFF8;
++    const uint32_t data_end = ((task->t.data_ptr & 0xFFFFFF) + task->t.data_size + 7) & ~7u;
++    if (task->t.data_size != 0 && data_end <= 0x800000) {
++        copy->data_address = data_start;
++        copy->data.assign(rdram + data_start, rdram + data_end);
++    }
++    std::lock_guard lock{ submitted_tasks.mutex };
++    for (std::shared_ptr<const SubmittedTask>& submitted : submitted_tasks.tasks) {
++        if (submitted != nullptr && submitted->original == task) {
++            submitted = std::move(copy);
++            return;
++        }
++    }
++    submitted_tasks.tasks[submitted_tasks.next] = std::move(copy);
++    submitted_tasks.next = (submitted_tasks.next + 1) % std::size(submitted_tasks.tasks);
++#endif
++}
++
+ bool ultramodern::rsp::run_task(RDRAM_ARG const OSTask* task) {
+     assert(rsp_callbacks.run_task != nullptr);
+ 
++#if ULTRAMODERN_RSP_TASKS_COPIED
++    std::shared_ptr<const SubmittedTask> copy;
++    {
++        std::lock_guard lock{ submitted_tasks.mutex };
++        for (const std::shared_ptr<const SubmittedTask>& submitted : submitted_tasks.tasks) {
++            if (submitted != nullptr && submitted->original == task) {
++                copy = submitted;
++            }
++        }
++    }
++    if (copy != nullptr) {
++        submitted_data = { copy->data_address, static_cast<uint32_t>(copy->data.size()), const_cast<uint8_t*>(copy->data.data()) };
++        const bool ran = rsp_callbacks.run_task(PASS_RDRAM &copy->task);
++        submitted_data = {};
++        return ran;
++    }
++#endif
+     return rsp_callbacks.run_task(PASS_RDRAM task);
+ }
+diff --git a/ultramodern/src/threadqueue.cpp b/ultramodern/src/threadqueue.cpp
+index f9c0fa1..fb774ec 100644
+--- a/ultramodern/src/threadqueue.cpp
++++ b/ultramodern/src/threadqueue.cpp
+@@ -1,4 +1,5 @@
+ #include <cassert>
++#include <cstdio>
+ 
+ #include "ultramodern/ultramodern.hpp"
+ 
+@@ -14,6 +15,19 @@ static PTR(OSThread)* queue_to_ptr(RDRAM_ARG PTR(PTR(OSThread)) queue) {
+ void ultramodern::thread_queue_insert(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) toadd_) {
+     PTR(OSThread)* cur = queue_to_ptr(PASS_RDRAM queue_);
+     OSThread* toadd = TO_PTR(OSThread, toadd_); 
++    // A thread already in the queue isn't put in again: that links it to itself, and every later walk of the queue
++    // goes round for good, which hangs the game. osStartThread on a thread that isn't stopped does it without
++    // ULTRAMODERN_LIBULTRA_THREAD_STOP; anything else that does is said once, so it can be found.
++    for (PTR(OSThread) queued = *cur; queued != NULLPTR; queued = TO_PTR(OSThread, queued)->next) {
++        if (queued == toadd_) {
++            static bool reported = false;
++            if (!reported) {
++                reported = true;
++                fprintf(stderr, "ultramodern: thread %d was put in a queue it was in already\n", toadd->id);
++            }
++            return;
++        }
++    }
+     debug_printf("[Thread Queue] Inserting thread %d into queue 0x%08X\n", toadd->id, (uintptr_t)queue_);
+     while (*cur && TO_PTR(OSThread, *cur)->priority > toadd->priority) {
+         cur = &TO_PTR(OSThread, *cur)->next;
+@@ -41,16 +55,22 @@ PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_)
+ }
+ 
+ bool ultramodern::thread_queue_remove(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_) {
++    // osDestroyThread passes a thread that isn't stopped but is on no queue (one that ran and returned) with a null
++    // queue: there is nothing to take it off, as upstream's loop never started for one.
++    if (queue_ == NULLPTR) {
++        return false;
++    }
+     debug_printf("[Thread Queue] Removing thread %d from queue 0x%08X\n", TO_PTR(OSThread, t_)->id, (uintptr_t)queue_);
+ 
+-    PTR(PTR(OSThread)) cur = queue_;
+-    while (cur != NULLPTR) {
+-        PTR(OSThread)* cur_ptr = queue_to_ptr(PASS_RDRAM queue_);
+-        if (*cur_ptr == t_) {
+-            *cur_ptr = TO_PTR(OSThread, *cur_ptr)->next;
++    PTR(OSThread)* cur = queue_to_ptr(PASS_RDRAM queue_);
++    while (*cur != NULLPTR) {
++        OSThread* cur_thread = TO_PTR(OSThread, *cur);
++        if (*cur == t_) {
++            *cur = cur_thread->next;
++            cur_thread->next = NULLPTR;
+             return true;
+         }
+-        cur = TO_PTR(OSThread, *cur_ptr)->next;
++        cur = &cur_thread->next;
+     }
+ 
+     return false;
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index 6e3ed18..00eefe6 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -147,6 +147,15 @@ void ultramodern::set_native_thread_name(const std::string& name) {
+     pthread_setname_np(name.c_str());
+ }
+ 
++void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
++#elif defined(__EMSCRIPTEN__)
++#include <emscripten/threading.h>
++
++void ultramodern::set_native_thread_name(const std::string& name) {
++    emscripten_set_thread_name(pthread_self(), name.c_str());
++}
++
++// Web workers have no priorities.
+ void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
+ #endif
+ 
+@@ -237,7 +246,26 @@ extern "C" void osStartThread(RDRAM_ARG PTR(OSThread) t_) {
+ 
+     // If this is a game thread, insert the new thread into the running queue and then check the running queue.
+     if (thread_self) {
++#if ULTRAMODERN_LIBULTRA_THREAD_STOP
++        // Only a stopped thread can be started (libultra ignores the call otherwise).
++        if (t->state != OSThreadState::STOPPED) {
++            return;
++        }
++        // A thread stopped by another thread while it was blocked on a message queue goes back on that queue,
++        // and the queue's first waiter is made runnable so that it rechecks the queue, like libultra does.
++        // Messages that arrived while the thread was stopped are picked up that way.
++        if (t->queue != NULLPTR && t->queue != ultramodern::running_queue) {
++            PTR(PTR(OSThread)) waiting_queue = t->queue;
++            ultramodern::thread_queue_insert(PASS_RDRAM waiting_queue, t_);
++            t->state = OSThreadState::BLOCKED;
++            ultramodern::schedule_running_thread(PASS_RDRAM ultramodern::thread_queue_pop(PASS_RDRAM waiting_queue));
++        }
++        else {
++            ultramodern::schedule_running_thread(PASS_RDRAM t_);
++        }
++#else
+         ultramodern::schedule_running_thread(PASS_RDRAM t_);
++#endif
+         ultramodern::check_running_queue(PASS_RDRAM1);
+     }
+     // Otherwise, immediately start the thread and terminate this one.
+@@ -276,11 +304,35 @@ extern "C" void osStopThread(RDRAM_ARG PTR(OSThread) t_) {
+     }
+     // Check if the thread is stopping itself (arg is null or thread_self).
+     if (t_ == thread_self) {
++#if ULTRAMODERN_LIBULTRA_THREAD_STOP
++        // Stopped, so that osStartThread starts it again: a running thread's state is still QUEUED from when it was
++        // scheduled, and osStartThread ignores a thread that isn't stopped.
++        TO_PTR(OSThread, t_)->state = OSThreadState::STOPPED;
++#endif
+         ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
+     }
++#if ULTRAMODERN_LIBULTRA_THREAD_STOP
++    // Stopping another thread: it is either waiting in the running queue or blocked on a message queue (only one
++    // game thread runs at a time). Take it off that queue so nothing schedules it until osStartThread, but keep
++    // t->queue so that osStartThread can put a blocked thread back where it was waiting.
++    else {
++        OSThread* t = TO_PTR(OSThread, t_);
++        if (t->state == OSThreadState::STOPPED) {
++            return;
++        }
++        if (t->queue != NULLPTR) {
++            ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
++        }
++        if (t->queue == ultramodern::running_queue) {
++            t->queue = NULLPTR;
++        }
++        t->state = OSThreadState::STOPPED;
++    }
++#else
+     else {
+         assert(false);
+     }
++#endif
+ }
+ 
+ extern "C" void osDestroyThread(RDRAM_ARG PTR(OSThread) t_) {
+diff --git a/ultramodern/src/timer.cpp b/ultramodern/src/timer.cpp
+index ee26c45..9c00296 100644
+--- a/ultramodern/src/timer.cpp
++++ b/ultramodern/src/timer.cpp
+@@ -1,6 +1,7 @@
+ #include <thread>
+ #include <variant>
+ #include <set>
++#include <unordered_map>
+ #include "blockingconcurrentqueue.h"
+ 
+ #include "ultramodern/ultra64.h"
+@@ -20,6 +21,38 @@ constexpr uint32_t speed_multiplier = 1;
+ // N64 CPU counter ticks per millisecond
+ constexpr uint32_t counter_per_ms = 46'875 * speed_multiplier;
+ 
++#if defined(__EMSCRIPTEN__)
++// The timer thread's queue, whose wait_dequeue_timed ends at its time. On a page a timed wait can end long after its
++// time: in Firefox on Windows every one ends on the system timer's tick, 15.6 ms unless the browser's process asks for
++// a finer one, so a timer a fraction of a millisecond away fired a tick late, and the game thread waiting for it waited
++// that long (Conker's timers are 0.4 ms or less, about 60 a second). So a timer less than 2 ms away is waited for by
++// polling the queue, and a farther one on a timer as before: polling the last stretch before those too, up to a tick,
++// kept the browser ~0.6 cores busier in Firefox with Banjo's page and presented no more.
++template<typename T>
++struct TimerQueue : moodycamel::BlockingConcurrentQueue<T> {
++    TimerQueue() : moodycamel::BlockingConcurrentQueue<T>() {}
++
++    template<typename Rep, typename Period>
++    bool wait_dequeue_timed(T& item, const std::chrono::duration<Rep, Period>& timeout) {
++        if (timeout >= std::chrono::milliseconds(2)) {
++            return moodycamel::BlockingConcurrentQueue<T>::wait_dequeue_timed(item, timeout);
++        }
++
++        const auto deadline = std::chrono::high_resolution_clock::now() + timeout;
++        while (std::chrono::high_resolution_clock::now() < deadline) {
++            if (this->try_dequeue(item)) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++};
++#else
++template<typename T>
++using TimerQueue = moodycamel::BlockingConcurrentQueue<T>;
++#endif
++
+ struct OSTimer {
+     PTR(OSTimer) unused1;
+     PTR(OSTimer) unused2;
+@@ -41,7 +74,7 @@ using Action = std::variant<AddTimerAction, RemoveTimerAction>;
+ 
+ struct {
+     std::thread thread;
+-    moodycamel::BlockingConcurrentQueue<Action> action_queue{};
++    TimerQueue<Action> action_queue{};
+ } timer_context;
+ 
+ uint64_t duration_to_ticks(std::chrono::high_resolution_clock::duration duration) {
+@@ -66,10 +99,73 @@ uint64_t time_now() {
+     return duration_to_ticks(std::chrono::high_resolution_clock::now() - start_time);
+ }
+ 
++#if defined(__EMSCRIPTEN__)
++// The timer thread's active timers, ordered by a copy of each one's timestamp taken as it is inserted, not by the
++// timestamp in the OSTimer: osSetTimer writes that on the game's thread as it is called, and a game that restarts a
++// timer still pending (osStopTimer, then osSetTimer, as Banjo-Tooie's scheduler does at each retrace with two timers)
++// moved it inside a set ordered by it while it was there. Out of order, the set's erase missed it, so the timer stayed
++// first and fired at every pass with no wait, its messages held for a full queue (ULTRAMODERN_HOLD_BLOCKED_MESSAGES)
++// faster than the game took them: the game thread receiving them never blocked again, the threads below it never ran,
++// and the held messages took the heap at about 13 MB a second to Aborted(OOM). A timer is still pending at its restart
++// only where the timer thread runs late, which on a phone's slow cores it does at a level change. It has the calls the
++// timer thread makes on a std::set, so the thread's loop is the same either way.
++class TimerSet {
++public:
++    TimerSet(RDRAM_ARG1) : rdram(rdram) {}
++
++    bool empty() const {
++        return timers.empty();
++    }
++
++    // The first entry, the timer closest to running out.
++    auto begin() const {
++        return timers.begin();
++    }
++
++    // Adds a timer at its timestamp now, in place of where it was if it is active already.
++    void insert(PTR(OSTimer) timer_) {
++        erase(timer_);
++        OSTime timestamp = TO_PTR(OSTimer, timer_)->timestamp;
++        timers.insert(Entry{ timestamp, timer_ });
++        keys[timer_] = timestamp;
++    }
++
++    void erase(PTR(OSTimer) timer_) {
++        auto found = keys.find(timer_);
++        if (found != keys.end()) {
++            timers.erase(Entry{ found->second, timer_ });
++            keys.erase(found);
++        }
++    }
++
++private:
++    // An entry reads as its timer, as a std::set<PTR(OSTimer)>'s does.
++    struct Entry {
++        OSTime timestamp;
++        PTR(OSTimer) timer;
++
++        operator PTR(OSTimer)() const {
++            return timer;
++        }
++
++        bool operator<(const Entry& other) const {
++            return timestamp != other.timestamp ? timestamp < other.timestamp : timer < other.timer;
++        }
++    };
++
++    uint8_t* rdram;
++    std::set<Entry> timers{};
++    std::unordered_map<PTR(OSTimer), OSTime> keys{};
++};
++#endif
++
+ void timer_thread(RDRAM_ARG1) {
+     ultramodern::set_native_thread_name("Timer Thread");
+     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::VeryHigh);
+ 
++#if defined(__EMSCRIPTEN__)
++    TimerSet active_timers{PASS_RDRAM1};
++#else
+     // Lambda comparator function to keep the set ordered
+     auto timer_sort = [PASS_RDRAM1](PTR(OSTimer) a_, PTR(OSTimer) b_) {
+         OSTimer* a = TO_PTR(OSTimer, a_);
+@@ -86,6 +182,7 @@ void timer_thread(RDRAM_ARG1) {
+ 
+     // Ordered set of timers that are currently active
+     std::set<PTR(OSTimer), decltype(timer_sort)> active_timers{timer_sort};
++#endif
+     
+     // Lambda to process a timer action to handle adding and removing timers
+     auto process_timer_action = [&](const Action& action) {

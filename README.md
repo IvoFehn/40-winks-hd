@@ -1,67 +1,67 @@
 # 40 Winks HD
 
-A Windows texture rework for the Nintendo 64 prototype of *40 Winks*. Look for sharper bedroom posters, repainted ship decks and new portraits and lettering in the original levels.
+40 Winks on Windows and in the browser, with statically recompiled game code and HD artwork.
 
-**[Download the Windows ZIP](https://github.com/IvoFehn/40-winks-hd/releases/download/v0.1.1/40-Winks-HD-v0.1.1-Windows-x64.zip)** · [Installation](#play-on-windows) · [Original vs. HD](#original-vs-hd)
+**[Download v0.2.0-preview](https://github.com/IvoFehn/40-winks-hd/releases/tag/v0.2.0-preview)** · [Build from source](docs/building.md) · [More screenshots](docs/screenshots.md)
 
-![Level select with original N64 textures on the left and 40 Winks HD v0.1.1 on the right](docs/images/level-select.jpg)
+![Original N64 textures on the left and HD artwork on the right](docs/images/level-select.jpg)
 
 ## Features
 
-- **2,476 replacement textures per pack.** Both HD and UHD are in the download. Most were redrawn with ImageGen using the game's artwork as a reference.
-- **Repainted environments.** Wood planks, cave masonry, grass, stained glass, quilt patterns and bedroom posters.
-- **Sharper UI.** Matching gold HUD digits, redrawn icons, revised subtitle spacing and new bitmap lettering.
-- **Rebuilt portraits and effects.** Tic Tac, the pirate and the parrot have revised cutouts. The packs also cover animated fire, smoke and water textures.
-- **Full HD, WQHD and 4K.** Choose 4:3 or 16:9. Native 4K renders at 3840 × 2160 in 16:9 or 2880 × 2160 in 4:3 and fits the result to your screen.
-- **Scene fixes.** Dedicated renderer and camera adjustments for frame edges in Moon Caves, Dungeons and Dragon Race.
+- **Native Windows EXE.** The N64 CPU code is compiled ahead of time into the application.
+- **Browser build.** WebAssembly game code with WebGPU rendering, local ROM import and offline startup after caching.
+- **2,476 replacements in each full pack.** Switch between Original, HD and UHD in the Windows overlay. The browser downloads the pack selected before launch.
+- **Live settings on Esc.** Graphics, texture quality, audio, controls and Quit Game in one menu.
+- **Display options.** Full HD, WQHD and 4K, with aspect-ratio controls. Windows offers fullscreen, windowed and borderless fullscreen.
+- **Keyboard, gamepad and browser touch controls.** Mobile has a lighter 18 MB pack of 1,141 replacements. Larger motifs use the ROM textures.
 
 ## Play on Windows
 
-You need Windows 10 or 11 (64-bit), an OpenGL-capable graphics driver and your own **European N64 prototype dated 7 October 1999** (English, Spanish and Italian, `.z64`). The ZIP supplies the launcher and textures. You provide the ROM.
+1. Download **40-Winks-HD-v0.2.0-preview-Windows-x64.zip** and extract the entire archive.
+2. Put your own **European N64 prototype dated 7 October 1999** beside **40 Winks HD.exe**. The English/Spanish/Italian N4WX dump is supported.
+3. Open **40 Winks HD.exe**. The settings overlay opens on first launch. Pick a texture pack and close the overlay to play.
+4. Press **Esc** whenever you want to change settings or quit.
 
-1. **Download and extract** the full Windows ZIP to a writable folder on an NTFS drive, such as a folder under Downloads.
-2. **Copy your `.z64` into that folder**, right beside `40 Winks HD.exe`. Keep the `game` folder there too.
-3. **Open `40 Winks HD.exe`.** Choose `1` for Full HD (1920 × 1080), `2` for WQHD (2560 × 1440), `3` for 4K UHD or `4` for native 4K rendering, even on a smaller display.
-4. **Choose your framing.** Enter `1` for 4:3 or `2` for widescreen. Keep an internet connection on the first launch of each emulator mode so the launcher can set it up.
-5. **Pick the game's language with the arrow keys and press Enter.** Use the arrow keys to move. Open the launcher again after closing the game to change display mode.
+Keep the DLLs and `assets` folder alongside the EXE. Windows 10/11 x64 and a graphics driver supporting the renderer's Vulkan or Direct3D 12 backend are required.
 
-<details>
-<summary>Keyboard controls, saves and ROM check</summary>
+| Action | Keyboard |
+| --- | --- |
+| Move | WASD or arrow keys |
+| Confirm / N64 A | Enter or Space |
+| N64 B | Left Shift or C |
+| N64 Z | Q or Z |
+| N64 Start | P |
+| Camera / C buttons | I, J, K, L |
+| Settings | Esc |
 
-| Action | Modes 1–3 | Mode 4 |
-| --- | --- | --- |
-| Move | Arrow keys | Arrow keys |
-| Start / confirm language | Enter | Enter |
-| N64 A | X | D |
-| N64 B | C | X |
-| N64 Z | Z | Z |
+Gamepad defaults are included. Use Controls to change bindings. Windows keeps configuration and saves under `%LOCALAPPDATA%/40WinksHDPrototype`.
 
-Modes 1–3 share saves in `game/runtime/rmg/Save`. Mode 4 keeps its own in `game/runtime/4k-internal/saves`.
+## Play in a browser
 
-The launcher checks the file contents, so you can keep the original filename. If it reports a missing ROM, check that your `.z64` is beside the EXE and that PowerShell's `Get-FileHash -Algorithm SHA256 -LiteralPath 'your-game.z64'` returns this fingerprint.
+Extract **40-Winks-HD-v0.2.0-preview-Web.zip**. Run `python serve.py` in that folder, then open `http://127.0.0.1:8097/40WinksRecompiled.html`.
+
+Choose **Mobile**, **HD**, **UHD** or **Original**, press **Play**, then select your own ROM through **Load ROM**. The browser finishes loading the selected assets before starting the program. ROM data stays on the device and persists in local browser storage alongside settings and saves.
+
+The ZIP can also be hosted as static files over HTTPS. A hosted copy is needed to open it from another device. WebGPU, WebAssembly threads and cross-origin isolation are required. The bundled service worker supports static hosts that cannot set isolation headers.
+
+## Preview status
+
+The Windows build and browser startup use the same supported prototype. Basic rendering, HD replacement loading, keyboard controls and a cold offline browser restart have been checked. Browser touch controls were checked in a simulated mobile viewport. Real iPhone/Android compatibility, audio quality and later levels still need device and gameplay checks.
+
+The comparison images show the original ROM artwork and the v0.1.1 texture rework captured with the earlier renderer. Those same full HD/UHD packs are included in this release.
+
+![Shipwreck City with original artwork and the reworked pirate, deck and HUD](docs/images/shipwreck-city.jpg)
+
+## ROM and credits
+
+Supply your own game dump. Its SHA-256 in `.z64` byte order is
 
 ```text
-899B866A45DFBEBC8152A3122F28AA0BA906FB448DC6B2DC7C7442E7622B5442
+899b866a45dfbebc8152a3122f28aa0ba906fb448dc6b2dc7c7442e7622b5442
 ```
 
-</details>
+The source tree includes recompilation configuration, function addresses, dependency pins and patches. The CPU and RSP sources are generated locally from your ROM when building.
 
-## Original vs. HD
+Based on DreaXer's 40WinksRecomp / Dreamcompiled, N64Recomp, N64ModernRuntime, RecompFrontend and RT64. Web support uses N64Recomp-browser. [Build and dependency details](docs/building.md) · [Third-party credits](docs/third-party.md)
 
-Original N64 textures on the left, the released **v0.1.1 UHD pack** on the right. Both sides are rendered at 3840 × 2160 in the same scene, with texture replacements disabled for the original.
-
-### Shipwreck City
-
-![Shipwreck City comparison showing the pirate, the deck and the sleep counter](docs/images/shipwreck-city.jpg)
-
-### Atlantis
-
-![Atlantis comparison showing the shark portrait, subtitles and scenery](docs/images/atlantis.jpg)
-
-[More comparisons and capture details](docs/screenshots.md)
-
-## Release notes and credits
-
-v0.1.1 revised 121 textures in each pack. Some rare effects and variants still need in-game checks. Three ambiguous texture IDs use the original graphics. [Release notes](https://github.com/IvoFehn/40-winks-hd/releases/tag/v0.1.1) · [HD manifest](docs/hd-textures.csv) · [UHD manifest](docs/uhd-textures.csv)
-
-Unofficial fan project. The original game and characters belong to their respective rights holders. [Emulator credits and source](docs/third-party.md)
+Unofficial fan project. The original game and characters belong to their respective rights holders. Earlier emulator-based packages remain available under the v0.1.x tags.

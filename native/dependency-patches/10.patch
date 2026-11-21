@@ -1,0 +1,1607 @@
+diff --git a/recompinput/include/recompinput/players.h b/recompinput/include/recompinput/players.h
+index 4da2954..e18b61e 100644
+--- a/recompinput/include/recompinput/players.h
++++ b/recompinput/include/recompinput/players.h
+@@ -19,6 +19,7 @@ namespace recompinput {
+         size_t get_number_of_assigned_players();
+         size_t get_max_number_of_players();
+         bool is_single_player_mode();
++        bool uses_default_input(int player_index);
+         void set_single_player_mode(bool single_player);
+         void set_min_number_of_players(size_t min_players);
+         void set_max_number_of_players(size_t max_players);
+diff --git a/recompinput/src/input_state.cpp b/recompinput/src/input_state.cpp
+index 03ed871..6edc649 100644
+--- a/recompinput/src/input_state.cpp
++++ b/recompinput/src/input_state.cpp
+@@ -119,7 +119,7 @@ void recompinput::update_rumble() {
+         uint32_t duration = 1000000; // Dummy duration value that lasts long enough to matter as the game will reset rumble on its own.
+         {
+             std::lock_guard lock{ InputState.controllers_mutex };
+-            if (recompinput::players::is_single_player_mode()) {
++            if (recompinput::players::uses_default_input(i)) {
+                 for (const auto &controller : InputState.detected_controllers) {
+                     do_rumble(controller, rumble_strength, duration);
+                 }
+@@ -140,7 +140,7 @@ bool controller_button_state(int controller_num, int32_t input_id) {
+         bool ret = false;
+         {
+             std::lock_guard lock{ InputState.controllers_mutex };
+-            if (recompinput::players::is_single_player_mode()) {
++            if (recompinput::players::uses_default_input(controller_num)) {
+                 for (const auto &controller : InputState.detected_controllers) {
+                     ret |= SDL_GameControllerGetButton(controller, button);
+                 }
+@@ -183,7 +183,7 @@ float controller_axis_state(int controller_num, int32_t input_id, bool allow_sup
+             };
+ 
+             std::lock_guard lock{ InputState.controllers_mutex };
+-            if (recompinput::players::is_single_player_mode()) {
++            if (recompinput::players::uses_default_input(controller_num)) {
+                 for (SDL_GameController *controller : InputState.detected_controllers) {
+                     float controller_state = gather_axis_state(controller);
+                     if (fabsf(controller_state) > fabsf(ret)) {
+@@ -280,7 +280,7 @@ void recompinput::get_gyro_deltas(int controller_num, float* x, float* y) {
+     float sensitivity = (float)recompui::config::general::get_gyro_sensitivity() / 100.0f;
+     std::array<float, 2> cur_rotation_delta = { 0.0f, 0.0f };
+ 
+-    if (players::is_single_player_mode()) {
++    if (players::uses_default_input(controller_num)) {
+         {
+             std::lock_guard lock{ InputState.controllers_mutex };
+             for (const auto &state_pair : InputState.controller_states) {
+diff --git a/recompinput/src/players.cpp b/recompinput/src/players.cpp
+index bc43a52..d677460 100644
+--- a/recompinput/src/players.cpp
++++ b/recompinput/src/players.cpp
+@@ -54,6 +54,7 @@ public:
+ static struct {
+     bool single_player_mode = false;
+     bool is_assigning = false;
++    bool keyboard_fallback = false;
+     size_t min_players = 1;
+     size_t max_players = 4;
+     PlayerArray players;
+@@ -182,6 +183,10 @@ bool players::is_single_player_mode() {
+     return PlayerState.single_player_mode;
+ }
+ 
++bool players::uses_default_input(int player_index) {
++    return player_index == 0 && (PlayerState.single_player_mode || PlayerState.keyboard_fallback);
++}
++
+ void players::set_single_player_mode(bool single_player) {
+     if (!single_player && single_player != PlayerState.single_player_mode) {
+         purge_deferred_controller_profiles();
+@@ -255,7 +260,21 @@ void players::restore_saved_assignment() {
+             stale = true;
+         }
+     }
+-    if ((PlayerState.players.get_count() > 0 && !stale) || saved_players.empty() || playerassignment::is_active()) {
++    if (playerassignment::is_active() ||
++        (PlayerState.players.get_count() > 0 && !stale && !PlayerState.keyboard_fallback)) {
++        return;
++    }
++
++    auto use_keyboard_fallback = [] {
++        if (!PlayerState.keyboard_fallback) {
++            PlayerState.players = PlayerArray{};
++            PlayerState.players.add_keyboard_player();
++            PlayerState.keyboard_fallback = true;
++            apply_profiles_to_players();
++        }
++    };
++    if (saved_players.empty()) {
++        use_keyboard_fallback();
+         return;
+     }
+     if (stale) {
+@@ -313,8 +332,7 @@ void players::restore_saved_assignment() {
+                 next++;
+             }
+             if (next >= connected.size()) {
+-                printf("[assignment] restore waiting: a saved controller isn't connected yet (%zu connected)\n", connected.size());
+-                fflush(stdout);
++                use_keyboard_fallback();
+                 return;
+             }
+             printf("[assignment] saved controller %zu not matched by GUID: using connected controller %zu\n", p, next);
+@@ -354,6 +372,7 @@ void players::restore_saved_assignment() {
+     }
+ 
+     PlayerState.players = restored;
++    PlayerState.keyboard_fallback = false;
+     apply_profiles_to_players();
+     printf("[assignment] restored %zu player(s)\n", restored.get_count());
+     fflush(stdout);
+@@ -400,8 +419,12 @@ void playerassignment::commit_player_assignment() {
+     stop_and_close_modal();
+ 
+     PlayerState.players = PlayerState.temp_players;
++    PlayerState.keyboard_fallback = false;
+     apply_profiles_to_players();
+     save_assignment_file(PlayerState.players);
++    if (recompui::controls_page != nullptr) {
++        recompui::controls_page->force_update();
++    }
+ }
+ 
+ void playerassignment::add_keyboard_player() {
+diff --git a/recompinput/src/profiles.cpp b/recompinput/src/profiles.cpp
+index c89956e..c6f8fa0 100644
+--- a/recompinput/src/profiles.cpp
++++ b/recompinput/src/profiles.cpp
+@@ -94,10 +94,10 @@ namespace recompinput {
+     }
+ 
+     void profiles::reset_profile_bindings(int profile_index, InputDevice device) {
+-        // multiplayer keyboard profiles just get cleared completely because of overlapping key bindings.
++        // Additional keyboard players require independent bindings.
+         bool is_multiplayer_kb = false;
+         if (device == InputDevice::Keyboard) {
+-            for (size_t i = 0; i < recompinput::players::get_number_of_assigned_players(); i++) {
++            for (size_t i = 1; i < recompinput::players::get_max_number_of_players(); i++) {
+                 if (get_mp_keyboard_profile_index(i) == profile_index) {
+                     is_multiplayer_kb = true;
+                     break;
+@@ -362,7 +362,11 @@ namespace recompinput {
+                 InputDevice::Keyboard,
+                 false
+             );
+-            clear_all_mappings(profile_index);
++            if (player_index == 0) {
++                reset_profile_bindings(profile_index, InputDevice::Keyboard);
++            } else {
++                clear_all_mappings(profile_index);
++            }
+         }
+         return profile_index;
+     }
+@@ -397,8 +401,9 @@ namespace recompinput {
+                 cur_y += recompinput::get_input_analog(player_index, mappings[(size_t)GameInput::Y_AXIS_POS]) - recompinput::get_input_analog(player_index, mappings[(size_t)GameInput::Y_AXIS_NEG]);
+             };
+             
+-            int profile_index_cont = players::is_single_player_mode() ? profiles::get_sp_controller_profile_index() : players_input_profile_indices[player_index].first;
+-            int profile_index_kb = players::is_single_player_mode() ? profiles::get_sp_keyboard_profile_index() : players_input_profile_indices[player_index].second;
++            bool default_input = players::uses_default_input(player_index);
++            int profile_index_cont = default_input ? profiles::get_sp_controller_profile_index() : players_input_profile_indices[player_index].first;
++            int profile_index_kb = default_input ? profiles::get_sp_keyboard_profile_index() : players_input_profile_indices[player_index].second;
+             check_buttons(profile_index_cont);
+             check_buttons(profile_index_kb);
+ 
+diff --git a/recompui/include/recompui/config.h b/recompui/include/recompui/config.h
+index 0a5daec..9537519 100644
+--- a/recompui/include/recompui/config.h
++++ b/recompui/include/recompui/config.h
+@@ -52,6 +52,8 @@ namespace recompui {
+             namespace options {
+                 inline const std::string developer_mode = "developer_mode";
+                 inline const std::string res_option = "res_option";
++                inline const std::string texture_pack = "texture_pack";
++                inline const std::string advanced_graphics = "advanced_graphics";
+                 inline const std::string wm_option = "wm_option";
+                 inline const std::string hr_option = "hr_option";
+                 inline const std::string api_option = "api_option";
+diff --git a/recompui/include/recompui/renderer.h b/recompui/include/recompui/renderer.h
+index 33f79ab..c5e9463 100644
+--- a/recompui/include/recompui/renderer.h
++++ b/recompui/include/recompui/renderer.h
+@@ -35,6 +35,7 @@ namespace recompui {
+ 
+         private:
+             std::unique_ptr<RT64::Application> app;
++            std::filesystem::path bundled_texture_pack;
+             std::unordered_set<std::string> enabled_texture_packs;
+             std::unordered_set<std::string> secondary_disabled_texture_packs;
+             uint32_t last_refresh_rate = 0;
+@@ -49,6 +50,7 @@ namespace recompui {
+         bool RT64SamplePositionsSupported();
+         bool RT64HighPrecisionFBEnabled();
+ 
++        void set_bundled_texture_pack(std::filesystem::path path);
+         void trigger_texture_pack_update();
+         void enable_texture_pack(const recomp::mods::ModContext& context, const recomp::mods::ModHandle& mod);
+         void disable_texture_pack(const recomp::mods::ModHandle& mod);
+diff --git a/recompui/src/base/ui_state.cpp b/recompui/src/base/ui_state.cpp
+index 0540ab5..3bf11a6 100644
+--- a/recompui/src/base/ui_state.cpp
++++ b/recompui/src/base/ui_state.cpp
+@@ -695,6 +695,11 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
+     bool all_input_is_disabled = recompinput::all_input_disabled();
+ 
+     while (recompui::try_deque_event(cur_event)) {
++        if (cur_event.type == SDL_KEYDOWN && cur_event.key.repeat &&
++            cur_event.key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
++            continue;
++        }
++
+         bool context_capturing_input = recompui::is_context_capturing_input();
+         bool context_capturing_mouse = recompui::is_context_capturing_mouse();
+ 
+@@ -834,7 +839,7 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
+                 SDL_ControllerButtonEvent* button_event = &cur_event.cbutton;
+                 SDL_JoystickID joystick_id = button_event->which;
+                 int profile_index;
+-                if (recompinput::players::is_single_player_mode()) {
++                if (recompinput::players::uses_default_input(0)) {
+                     profile_index = recompinput::profiles::get_sp_controller_profile_index();
+                 }
+                 else {
+@@ -851,6 +856,7 @@ void draw_hook(plume::RenderCommandList* command_list, plume::RenderFramebuffer*
+ 
+             if (open_config) {
+                 recompui::config::open();
++                config_was_open = true;
+             }
+         }
+     } // end dequeue event loop
+diff --git a/recompui/src/config/ui_config.cpp b/recompui/src/config/ui_config.cpp
+index 905045e..c0c651c 100644
+--- a/recompui/src/config/ui_config.cpp
++++ b/recompui/src/config/ui_config.cpp
+@@ -1,6 +1,7 @@
+ #include "recompui/config.h"
++#include "ui_settings_style.h"
+ #include "elements/ui_modal.h"
+-#include "elements/ui_icon_button.h"
++#include "elements/ui_button.h"
+ #include "ui_config_page_options_menu.h"
+ #include "recompinput/profiles.h"
+ #include "recompinput/players.h"
+@@ -162,8 +163,18 @@ namespace recompui {
+             throw std::runtime_error("Config modal has already been initialized.");
+         }
+ 
+-        config_modal = TabbedModal::create_modal(ModalType::Fullscreen);
+-        config_modal->modal_root_context.open();
++        config_modal = TabbedModal::create_modal(ModalType::Settings);
++        auto context = config_modal->modal_root_context;
++        context.open();
++        auto header_left = config_modal->get_header()->get_left();
++        auto title = context.create_element<Label>(header_left, "Settings", theme::Typography::Header3);
++        title->set_font_size(28.0f);
++        title->set_font_weight(650);
++        title->set_line_height(34.0f);
++        title->set_letter_spacing(0.0f);
++        title->set_color(settings_style::text);
++        title->set_padding_left(28.0f);
++        title->set_padding_right(24.0f);
+         for (auto &tab : pending_tabs) {
+             config_modal->add_tab(tab.name, tab.id, tab.callbacks.create_contents, tab.callbacks.can_close, tab.callbacks.on_close);
+             if (tab.hidden) {
+@@ -173,9 +184,9 @@ namespace recompui {
+                 config_modal->set_tab_selectable(tab.id, false);
+             }
+         }
+-        config_modal->set_selected_tab(0);
++        config_modal->set_selected_tab(graphics::id);
+         auto header_right = config_modal->get_header()->get_right();
+-        auto quit_button = config_modal->modal_root_context.create_element<IconButton>(header_right, "icons/Quit.svg", ButtonStyle::Basic);
++        auto quit_button = context.create_element<Button>(header_right, "Quit game", ButtonStyle::Basic, ButtonSize::Medium);
+         quit_button->add_pressed_callback([]() {
+             if (ultramodern::is_game_started()) {
+                 recompui::open_quit_game_prompt();
+@@ -183,7 +194,7 @@ namespace recompui {
+                 ultramodern::quit();
+             }
+         });
+-        auto close_button = config_modal->modal_root_context.create_element<IconButton>(header_right, "icons/X.svg", ButtonStyle::Basic);
++        auto close_button = context.create_element<Button>(header_right, "Close", ButtonStyle::Tertiary, ButtonSize::Medium);
+         close_button->add_pressed_callback([]() {
+             config::close();
+         });
+diff --git a/recompui/src/config/ui_config_option.cpp b/recompui/src/config/ui_config_option.cpp
+index 2a53ae7..c0908bc 100644
+--- a/recompui/src/config/ui_config_option.cpp
++++ b/recompui/src/config/ui_config_option.cpp
+@@ -1,8 +1,9 @@
+ #include "ui_config_option.h"
++#include "ui_settings_style.h"
+ 
+ namespace recompui {
+ 
+-constexpr float config_option_element_margin_vertical = 12.0f;
++constexpr float config_option_element_margin_vertical = 13.0f;
+ ConfigOptionElement::ConfigOptionElement(
+     ResourceId rid,
+     Element *parent,
+@@ -25,8 +26,8 @@ ConfigOptionElement::ConfigOptionElement(
+     set_align_items(AlignItems::FlexStart);
+     set_justify_content(JustifyContent::FlexStart);
+     set_padding_top(config_option_element_margin_vertical);
+-    set_padding_left(12.0f);
+-    set_padding_right(12.0f);
++    set_border_bottom_width(1.0f);
++    set_border_bottom_color(settings_style::divider);
+     set_padding_bottom(config_option_element_margin_vertical);
+     set_height_auto();
+     set_width(100.0f, Unit::Percent);
+@@ -38,16 +39,17 @@ ConfigOptionElement::ConfigOptionElement(
+     auto name_text = option.name;
+     if (!name_text.empty()) {
+         name_label = context.create_element<Label>(this, name_text, theme::Typography::LabelMD);
++        name_label->set_font_size(21.0f);
++        name_label->set_line_height(26.0f);
++        name_label->set_font_weight(600);
++        name_label->set_letter_spacing(0.0f);
++        name_label->set_color(settings_style::text);
+         name_label->set_margin_bottom(8.0f);
+     } else {
+         name_label = context.create_element<Label>(this, "", theme::Typography::LabelMD);
+         set_padding_top(0.0f);
+     }
+ 
+-    // 40winks: option names in game lettering.
+-    name_label->enable_game_text(1); // swinging letters
+-    name_label->set_text(name_text);
+-
+     update_hidden();
+ }
+ 
+@@ -109,7 +111,8 @@ ConfigOptionEnum::ConfigOptionEnum(
+     size_t option_index,
+     const recomp::config::Config *config,
+     set_option_value_t set_option_value,
+-    on_option_hover_t on_hover
++    on_option_hover_t on_hover,
++    bool use_dropdown
+ ) : ConfigOptionElement(rid, parent, option_id, option_index, config, set_option_value, on_hover)
+ {
+     ContextId context = recompui::get_current_context();
+@@ -121,30 +124,48 @@ ConfigOptionEnum::ConfigOptionEnum(
+     wrapper->set_width(100.0f, Unit::Percent);
+     wrapper->set_gap(12.0f);
+ 
+-    // Negates the extra padding that radio tabs automatically add.
+-    name_label->set_margin_bottom(4.0f);
+-
+-    radio = context.create_element<Radio>(wrapper);
+-    radio->set_focus_callback([this](bool active) {
++    wrapper->set_flex_wrap(FlexWrap::Wrap);
++    const auto &enum_opt = config->get_option_config<recomp::config::ConfigOptionEnum>(option_index);
++    auto on_focus = [this](bool active) {
+         if (active) {
+             this->on_hover(this->option_id);
++            scroll_into_view();
+         }
+-    });
+-    radio->add_index_changed_callback([this](uint32_t index) {
+-        auto &enum_opt = this->config->get_option_config<recomp::config::ConfigOptionEnum>(this->option_index);
+-        if (index < enum_opt.options.size()) {
+-            this->set_option_value(this->option_id, enum_opt.options[index].value);
++    };
++    auto on_selection = [this](size_t index) {
++        const auto &options = this->config->get_option_config<recomp::config::ConfigOptionEnum>(this->option_index).options;
++        if (index < options.size() && get_value() != recomp::config::ConfigValueVariant(options[index].value)) {
++            this->set_option_value(this->option_id, options[index].value);
+         }
+-    });
++    };
++
++    if (use_dropdown) {
++        auto field = context.create_element<Element>(wrapper);
++        field->set_width(390.0f);
++        field->set_max_width(100.0f, Unit::Percent);
++        std::vector<SelectOption> options;
++        for (const auto &choice : enum_opt.options) {
++            options.emplace_back(choice.name, choice.key);
++        }
++        select = context.create_element<Select>(field, std::move(options));
++        select->use_settings_style();
++        select->set_focus_callback(on_focus);
++        select->add_change_callback([on_selection](SelectOption &, int index) { on_selection(index); });
++    } else {
++        radio = context.create_element<Radio>(wrapper);
++        radio->set_flex_wrap(FlexWrap::Wrap);
++        radio->set_gap(7.0f);
++        radio->set_max_width(100.0f, Unit::Percent);
++        radio->set_focus_callback(on_focus);
++        radio->add_index_changed_callback(on_selection);
++        for (uint32_t i = 0; i < enum_opt.options.size(); i++) {
++            radio->add_option(enum_opt.options[i].name);
++            radio->get_option_element(i)->use_settings_style();
++        }
++    }
+ 
+     details_label = context.create_element<Label>(wrapper, "", theme::Typography::LabelXS);
+-    details_label->set_color(theme::color::Primary);
+-
+-    auto &enum_opt = config->get_option_config<recomp::config::ConfigOptionEnum>(this->option_index);
+-    for (uint32_t i = 0; i < enum_opt.options.size(); i++) {
+-        radio->add_option(enum_opt.options[i].name);
+-        radio->get_option_element(i)->use_game_text(enum_opt.options[i].name); // 40winks
+-    }
++    details_label->set_color(settings_style::muted);
+ 
+     update_value();
+     update_enum_details();
+@@ -158,12 +179,18 @@ void ConfigOptionEnum::update_value() {
+     auto &enum_opt = config->get_option_config<recomp::config::ConfigOptionEnum>(this->option_index);
+     for (uint32_t i = 0; i < enum_opt.options.size(); i++) {
+         if (enum_opt.options[i].value == option_value) {
+-            radio->set_index(i);
++            if (select) {
++                select->set_selection(enum_opt.options[i].key);
++            } else {
++                radio->set_index(i);
++            }
+             return;
+         }
+     }
+     // No matching option, set invalid index so no option is selected
+-    radio->set_index(enum_opt.options.size());
++    if (radio) {
++        radio->set_index(enum_opt.options.size());
++    }
+ };
+ 
+ void ConfigOptionEnum::update_disabled() {
+@@ -184,8 +211,11 @@ void ConfigOptionEnum::update_enum_disabled() {
+     auto &enum_opt = config->get_option_config<recomp::config::ConfigOptionEnum>(option_index);
+     for (uint32_t i = 0; i < enum_opt.options.size(); i++) {
+         bool enum_disabled = all_disabled || config->get_enum_option_disabled(option_index, i);
+-        auto opt_element = radio->get_option_element(i);
+-        opt_element->set_enabled(!enum_disabled);
++        if (select) {
++            select->set_option_enabled(i, !enum_disabled);
++        } else {
++            radio->get_option_element(i)->set_enabled(!enum_disabled);
++        }
+     }
+ };
+ 
+@@ -219,8 +249,7 @@ ConfigOptionNumber::ConfigOptionNumber(
+             this->on_hover(this->option_id);
+         }
+     });
+-    slider->get_value_label()->enable_game_text(2); // 40winks: static letters, normal size
+-    apply_game_slider_style(slider); // 40winks
++    slider->get_value_label()->set_color(settings_style::muted);
+     update_value();
+     update_disabled();
+ };
+diff --git a/recompui/src/config/ui_config_option.h b/recompui/src/config/ui_config_option.h
+index 0561657..ec5d4e8 100644
+--- a/recompui/src/config/ui_config_option.h
++++ b/recompui/src/config/ui_config_option.h
+@@ -4,6 +4,7 @@
+ #include "elements/ui_element.h"
+ #include "elements/ui_label.h"
+ #include "elements/ui_radio.h"
++#include "elements/ui_select.h"
+ #include "elements/ui_text_input.h"
+ #include "elements/ui_slider.h"
+ #include "elements/ui_toggle.h"
+@@ -48,6 +49,7 @@ namespace recompui {
+ class ConfigOptionEnum : public ConfigOptionElement {
+ protected:
+     Radio *radio = nullptr;
++    Select *select = nullptr;
+     Label *details_label = nullptr;
+ 
+     std::string_view get_type_name() override { return "ConfigOptionEnum"; }
+@@ -59,7 +61,8 @@ public:
+         size_t option_index,
+         const recomp::config::Config *config,
+         set_option_value_t set_option_value,
+-        on_option_hover_t on_hover
++        on_option_hover_t on_hover,
++        bool use_dropdown
+     );
+ 
+     void update_value() override;
+diff --git a/recompui/src/config/ui_config_page_controls.cpp b/recompui/src/config/ui_config_page_controls.cpp
+index f379a6f..c234fcc 100644
+--- a/recompui/src/config/ui_config_page_controls.cpp
++++ b/recompui/src/config/ui_config_page_controls.cpp
+@@ -1,4 +1,5 @@
+ #include "ui_config_page_controls.h"
++#include "ui_settings_style.h"
+ #include "composites/ui_assign_players_modal.h"
+ #include "elements/ui_button.h"
+ #include "elements/ui_label.h"
+@@ -170,7 +171,7 @@ void GameInputRow::focus_on_first_binding() {
+ ConfigPageControls::ConfigPageControls(ResourceId rid, Element *parent) : ConfigPage(rid, parent) {
+     controls_page = this;
+ 
+-    multiplayer_enabled = recompinput::players::is_single_player_mode() == false;
++    multiplayer_enabled = !recompinput::players::uses_default_input(0);
+     this->max_num_players = multiplayer_enabled ? recompinput::players::get_max_number_of_players() : 1;
+     multiplayer_view_mappings = !multiplayer_enabled;
+ 
+@@ -241,6 +242,12 @@ void ConfigPageControls::force_update() {
+ }
+ 
+ void ConfigPageControls::render_all() {
++    const bool assigned_players = !recompinput::players::uses_default_input(0);
++    if (multiplayer_enabled != assigned_players) {
++        multiplayer_enabled = assigned_players;
++        max_num_players = multiplayer_enabled ? recompinput::players::get_max_number_of_players() : 1;
++        multiplayer_view_mappings = !multiplayer_enabled;
++    }
+     render_header();
+     render_body();
+     render_footer();
+@@ -354,9 +361,16 @@ void ConfigPageControls::render_body_mappings() {
+ 
+     // right side
+     {
+-        body->get_right()->clear_children();
+-        description_container = context.create_element<Element>(body->get_right(), 0, "p", true);
+-        description_container->set_text("");
++        auto help_column = body->get_right();
++        help_column->clear_children();
++        help_column->set_flex_grow(0.0f);
++        help_column->set_flex_basis(30.0f, Unit::Percent);
++        help_column->set_padding(28.0f);
++        help_column->set_padding_left(0.0f);
++        description_container = context.create_element<Element>(help_column, 0, "p", true);
++        description_container->set_font_size(18.0f);
++        description_container->set_line_height(28.0f);
++        description_container->set_color(settings_style::muted);
+     }
+ }
+ 
+@@ -474,18 +488,33 @@ void ConfigPageControls::render_footer() {
+         auto footer_left = footer->get_left();
+         footer_left->clear_children();
+         if (!multiplayer_enabled) {
+-            keyboard_toggle = context.create_element<IconToggle>(footer_left, "icons/Cont.svg", "icons/Keyboard.svg", ToggleSize::Large);
+-            keyboard_toggle->set_checked(single_player_show_keyboard_mappings);
+-            keyboard_toggle->add_checked_callback([this](bool checked) {
+-                this->single_player_show_keyboard_mappings = checked;
+-                this->update_control_mappings();
++            auto label = context.create_element<Label>(footer_left, "Input device", theme::Typography::LabelSM);
++            label->set_color(settings_style::muted);
++            auto device_field = context.create_element<Element>(footer_left);
++            device_field->set_width(230.0f);
++            auto device_select = context.create_element<Select>(
++                device_field,
++                std::vector<SelectOption>{{"Keyboard", "keyboard"}, {"Controller", "controller"}},
++                single_player_show_keyboard_mappings ? "keyboard" : "controller"
++            );
++            device_select->use_settings_style();
++            device_select->add_change_callback([this](SelectOption &option, int) {
++                single_player_show_keyboard_mappings = option.value == "keyboard";
++                update_control_mappings();
+             });
+         }
+     }
+     {
+         auto footer_right = footer->get_right();
+         footer_right->clear_children();
+-        auto reset_to_defaults_button = context.create_element<Button>(footer_right, "Reset to defaults", ButtonStyle::Warning);
++        if (!multiplayer_enabled && !recompinput::players::is_single_player_mode()) {
++            auto assign_players = context.create_element<Button>(footer_right, "Assign players", ButtonStyle::Basic, ButtonSize::Medium);
++            assign_players->add_pressed_callback([]() {
++                recompinput::playerassignment::start();
++                recompui::AssignPlayersModal::open();
++            });
++        }
++        auto reset_to_defaults_button = context.create_element<Button>(footer_right, "Reset to defaults", ButtonStyle::Tertiary, ButtonSize::Medium);
+         reset_to_defaults_button->add_pressed_callback([this]() {
+             recompinput::profiles::reset_profile_bindings(this->selected_profile_index, this->get_player_input_device());
+             this->update_control_mappings();
+@@ -505,6 +534,7 @@ void ConfigPageControls::render_control_mappings() {
+     body_left->set_position(Position::Relative);
+     body_left->set_height(100.0f, Unit::Percent);
+     body_left->set_max_height(100.0f, Unit::Percent);
++    body_left->set_flex_basis(70.0f, Unit::Percent);
+     body_left->set_overflow_y(Overflow::Auto);
+     
+     {
+diff --git a/recompui/src/config/ui_config_page_controls.h b/recompui/src/config/ui_config_page_controls.h
+index dd8ff24..6ad3f5c 100644
+--- a/recompui/src/config/ui_config_page_controls.h
++++ b/recompui/src/config/ui_config_page_controls.h
+@@ -101,7 +101,7 @@ protected:
+     bool multiplayer_enabled;
+     bool multiplayer_view_mappings;
+ 
+-    bool single_player_show_keyboard_mappings = false;
++    bool single_player_show_keyboard_mappings = true;
+ 
+     bool awaiting_binding = false;
+     bool awaiting_binding_for_menu_action_button = false;
+@@ -150,7 +150,6 @@ protected:
+     std::vector<PlayerCard*> player_cards;
+     std::vector<GameInputRowsWrapper*> rows_wrappers;
+     std::vector<GameInputRow*> game_input_rows;
+-    IconToggle *keyboard_toggle;
+     Element *description_container = nullptr;
+     on_player_bind_callback on_player_bind;
+     Element *nav_up_element = nullptr;
+diff --git a/recompui/src/config/ui_config_page_options_menu.cpp b/recompui/src/config/ui_config_page_options_menu.cpp
+index 6ba64e2..36cef11 100644
+--- a/recompui/src/config/ui_config_page_options_menu.cpp
++++ b/recompui/src/config/ui_config_page_options_menu.cpp
+@@ -1,4 +1,6 @@
+ #include "ui_config_page_options_menu.h"
++#include "ui_settings_style.h"
++#include "recompui/config.h"
+ 
+ 
+ namespace recompui {
+@@ -8,7 +10,7 @@ ConfigPageOptionsMenu::ConfigPageOptionsMenu(
+     Element *parent,
+     recomp::config::Config *config,
+     bool is_internal
+-) : ConfigPage(rid, parent, Events(EventType::Hover, EventType::Update, EventType::MenuAction)),
++) : ConfigPage(rid, parent, Events(EventType::Update, EventType::MenuAction)),
+     config(config),
+     is_internal(is_internal)
+ {
+@@ -16,11 +18,42 @@ ConfigPageOptionsMenu::ConfigPageOptionsMenu(
+     set_as_navigation_container(NavigationType::Vertical);
+ 
+     render_config_options();
+-    description_container = context.create_element<Element>(body->get_right(), 0, "p", true);
++
++    auto help_column = body->get_right();
++    help_column->set_flex_grow(0.0f);
++    help_column->set_flex_basis(30.0f, Unit::Percent);
++    help_column->set_min_width(0.0f);
++    help_column->set_padding_top(28.0f);
++    help_column->set_padding_right(28.0f);
++    help_column->set_padding_left(12.0f);
++    help_column->set_overflow_y(Overflow::Auto);
++
++    auto help_card = context.create_element<Element>(help_column);
++    help_card->set_padding(20.0f);
++    help_card->set_background_color(settings_style::inset);
++    help_card->set_border_width(1.0f);
++    help_card->set_border_color(settings_style::divider);
++    help_card->set_border_radius(12.0f);
++
++    description_title = context.create_element<Label>(help_card, theme::Typography::LabelMD);
++    description_title->set_color(settings_style::accent);
++    description_title->set_font_size(21.0f);
++    description_title->set_line_height(26.0f);
++    description_title->set_letter_spacing(0.0f);
++    description_title->set_margin_bottom(8.0f);
++
++    description_container = context.create_element<Element>(help_card, 0, "div", true);
+     description_container->set_typography(theme::Typography::Body);
++    description_container->set_font_size(18.0f);
+     description_container->set_line_height(28.0f);
+-    description_container->set_padding(8.0f);
+-    set_description_text("");
++    description_container->set_color(settings_style::muted);
++
++    for (size_t i = 0; i < config_option_elements.size(); ++i) {
++        if (!config->is_config_option_hidden(i)) {
++            on_option_hover(config_option_elements[i]->get_option_id());
++            break;
++        }
++    }
+ 
+     if (config->requires_confirmation) {
+         add_footer();
+@@ -101,13 +134,6 @@ void ConfigPageOptionsMenu::perform_option_render_updates() {
+ 
+ void ConfigPageOptionsMenu::process_event(const Event &e) {
+     switch (e.type) {
+-    case EventType::Hover: {
+-        bool active = std::get<EventHover>(e.variant).active;
+-        if (!active) {
+-            set_description_text("");
+-        }
+-        break;
+-    }
+     case EventType::Update: {
+         if (apply_button != nullptr) {
+             bool apply_enabled = this->apply_button->is_enabled();
+@@ -137,8 +163,29 @@ void ConfigPageOptionsMenu::process_event(const Event &e) {
+ void ConfigPageOptionsMenu::render_confirmation_footer() {
+     ContextId context = recompui::get_current_context();
+     footer->set_as_navigation_container(NavigationType::Horizontal);
++    footer->set_background_color(theme::color::Transparent);
++    footer->set_border_top_width(1.0f);
++    footer->set_border_top_color(settings_style::divider);
++    footer->set_padding_top(14.0f);
++    footer->set_padding_bottom(14.0f);
++    footer->set_padding_right(28.0f);
+ 
+-    apply_button = context.create_element<Button>(footer->get_right(), "Apply", ButtonStyle::Secondary);
++    apply_button = context.create_element<Button>(footer->get_right(), "Apply", ButtonStyle::Primary, ButtonSize::Medium);
++    apply_button->set_padding_left(20.0f);
++    apply_button->set_padding_right(20.0f);
++    apply_button->set_border_radius(8.0f);
++    apply_button->set_background_color(settings_style::accent);
++    apply_button->set_border_color(settings_style::accent);
++    apply_button->set_color(settings_style::accent_ink);
++    apply_button->get_hover_style()->set_background_color(settings_style::accent_hover);
++    apply_button->get_hover_style()->set_border_color(settings_style::accent_hover);
++    apply_button->get_hover_style()->set_color(settings_style::accent_ink);
++    apply_button->get_focus_style()->set_background_color(settings_style::accent_hover);
++    apply_button->get_focus_style()->set_border_color(settings_style::accent_hover);
++    apply_button->get_focus_style()->set_color(settings_style::accent_ink);
++    apply_button->get_disabled_style()->set_background_color(settings_style::control);
++    apply_button->get_disabled_style()->set_border_color(settings_style::divider);
++    apply_button->get_disabled_style()->set_color(settings_style::subdued);
+     apply_button->set_enabled(false);
+     apply_button->set_as_primary_focus();
+     apply_button->add_pressed_callback([this]() {
+@@ -163,13 +210,17 @@ void ConfigPageOptionsMenu::render_config_options() {
+     body_left->set_display(Display::Block);
+     body_left->set_position(Position::Relative);
+     body_left->set_height(100.0f, Unit::Percent);
++    body_left->set_min_width(0.0f);
++    body_left->set_flex_basis(70.0f, Unit::Percent);
+     {
+         auto body_left_scroll = context.create_element<Element>(body_left, 0, "div", false);
+         body_left_scroll->set_display(Display::Block);
+         body_left_scroll->set_width(100.0f, Unit::Percent);
+         body_left_scroll->set_min_height(100.0f, Unit::Percent);
+         body_left_scroll->set_max_height(100.0f, Unit::Percent);
+-        body_left_scroll->set_padding(16.0f);
++        body_left_scroll->set_padding(14.0f);
++        body_left_scroll->set_padding_left(28.0f);
++        body_left_scroll->set_padding_right(28.0f);
+         body_left_scroll->set_overflow_y(Overflow::Auto);
+         body_left_scroll->set_as_navigation_container(NavigationType::Vertical);
+ 
+@@ -186,13 +237,18 @@ void ConfigPageOptionsMenu::render_config_options() {
+             ConfigOptionElement *element = nullptr;
+             switch (config_option.type) {
+                 case recomp::config::ConfigOptionType::Enum: {
++                    using namespace recompui::config::graphics::options;
++                    bool use_dropdown = is_internal && (
++                        config_option.id == texture_pack || config_option.id == res_option ||
++                        config_option.id == wm_option || config_option.id == ar_option);
+                     element = context.create_element<ConfigOptionEnum>(
+                         body_left_scroll,
+                         config_option.id,
+                         i,
+                         config,
+                         bound_set_option_value,
+-                        bound_on_option_hover
++                        bound_on_option_hover,
++                        use_dropdown
+                     );
+                     break;
+                 }
+@@ -243,7 +299,9 @@ void ConfigPageOptionsMenu::render_config_options() {
+ void ConfigPageOptionsMenu::on_option_hover(const std::string &option_id) {
+     if (description_container) {
+         description_option_id = option_id;
+-        set_description_text(config->get_option(option_id).description);
++        const auto &option = config->get_option(option_id);
++        description_title->set_text(option.name);
++        set_description_text(option.description);
+     }
+ }
+ 
+diff --git a/recompui/src/config/ui_config_page_options_menu.h b/recompui/src/config/ui_config_page_options_menu.h
+index 49e05db..c15c3c0 100644
+--- a/recompui/src/config/ui_config_page_options_menu.h
++++ b/recompui/src/config/ui_config_page_options_menu.h
+@@ -14,6 +14,7 @@ namespace recompui {
+         bool is_internal = false;
+ 
+         std::vector<ConfigOptionElement*> config_option_elements;
++        Label *description_title = nullptr;
+         Element *description_container = nullptr;
+         std::string description_option_id = "";
+         Button *apply_button = nullptr;
+diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
+index 60b1cc8..0d9612f 100644
+--- a/recompui/src/config/ui_config_tab_graphics.cpp
++++ b/recompui/src/config/ui_config_tab_graphics.cpp
+@@ -2,6 +2,9 @@
+ #include "recompui/config.h"
+ #include "recompui/renderer.h"
+ #include "util/steam_deck.h"
++#include "util/file.h"
++
++#include <array>
+ 
+ static bool created_graphics_config = false;
+ 
+@@ -20,9 +23,12 @@ namespace recompui {
+ 
+         using EnumOptionVector = const std::vector<recomp::config::ConfigOptionEnumOption>;
+         static EnumOptionVector resolution_options = {
+-            {ultramodern::renderer::Resolution::Original, "Original", "Original"},
+-            {ultramodern::renderer::Resolution::Original2x, "Original2x", "Original 2x"},
++            {ultramodern::renderer::Resolution::Original, "Original", "Original (240p)"},
++            {ultramodern::renderer::Resolution::Original2x, "Original2x", "Original 2x (480p)"},
+             {ultramodern::renderer::Resolution::Auto, "Auto", "Auto"},
++            {ultramodern::renderer::Resolution::FullHD, "1080p", "Full HD (1080p)"},
++            {ultramodern::renderer::Resolution::WQHD, "1440p", "WQHD (1440p)"},
++            {ultramodern::renderer::Resolution::UHD, "2160p", "4K UHD (2160p)"},
+         };
+ 
+         enum class DownsamplingOption {
+@@ -38,7 +44,10 @@ namespace recompui {
+ 
+         static EnumOptionVector window_mode_options = {
+             {ultramodern::renderer::WindowMode::Windowed, "Windowed"},
+-            {ultramodern::renderer::WindowMode::Fullscreen, "Fullscreen"}
++            {ultramodern::renderer::WindowMode::Fullscreen, "Fullscreen"},
++#if defined(_WIN32)
++            {ultramodern::renderer::WindowMode::BorderlessFullscreen, "BorderlessFullscreen", "Borderless Fullscreen"},
++#endif
+         };
+ 
+         #if defined(_WIN32)
+@@ -99,7 +108,7 @@ namespace recompui {
+             switch (res_option) {
+                 default:
+                 case ultramodern::renderer::Resolution::Auto:
+-                    return "Downsampling is not available at auto resolution";
++                    return "Downsampling is available at Original and Original 2x.";
+                 case ultramodern::renderer::Resolution::Original:
+                     if (ds_option == DownsamplingOption::X2) {
+                         return "Rendered in 480p and scaled to 240p";
+@@ -162,6 +171,23 @@ namespace recompui {
+                 "<recomp-color primary>Detected display refresh rate: " + std::to_string(refresh_rate) + "hz</recomp-color>";
+         }
+ 
++        static void update_manual_framerate_visibility(OptionChangeContext context) {
++            using ultramodern::renderer::RefreshRate;
++            const bool advanced = get_graphics_bool_value(graphics::options::advanced_graphics, context);
++            const auto framerate = get_graphics_enum_value<RefreshRate>(graphics::options::rr_option, context);
++            get_graphics_config().update_option_hidden(graphics::options::rr_manual_value, !advanced || framerate != RefreshRate::Manual);
++        }
++
++        static std::filesystem::path bundled_pack_path(uint32_t index) {
++            constexpr std::array pack_files = {"", "textures/Winks-HD.rtz", "textures/Winks-UHD.rtz"};
++            if (index == 0 || index >= pack_files.size()) {
++                return {};
++            }
++            auto path = file::get_asset_path(pack_files[index]);
++            std::error_code error;
++            return std::filesystem::is_regular_file(path, error) ? path : std::filesystem::path{};
++        }
++
+         static void apply_graphics_config() {
+             ultramodern::renderer::GraphicsConfig new_config;
+             new_config.developer_mode = get_graphics_bool_value(graphics::options::developer_mode);
+@@ -181,6 +207,7 @@ namespace recompui {
+             new_config.u2d_option = get_graphics_enum_value<int>(graphics::options::u2d_option);
+ 
+             ultramodern::renderer::set_graphics_config(new_config);
++            renderer::set_bundled_texture_pack(bundled_pack_path(get_graphics_enum_value<uint32_t>(graphics::options::texture_pack)));
+         }
+ 
+         void graphics::update_msaa_supported(bool supported) {
+@@ -217,7 +244,7 @@ namespace recompui {
+             auto new_wm = current_wm == ultramodern::renderer::WindowMode::Windowed ? ultramodern::renderer::WindowMode::Fullscreen : ultramodern::renderer::WindowMode::Windowed;
+             get_graphics_config().set_option_value(graphics::options::wm_option, static_cast<uint32_t>(new_wm));
+             get_graphics_config().apply_option_value(graphics::options::wm_option);
+-            apply_graphics_config();
++            get_graphics_config().save_config();
+         }
+ 
+         recomp::config::Config &create_graphics_tab(const std::string &name) {
+@@ -235,12 +262,23 @@ namespace recompui {
+                 true
+             );
+ 
++            uint32_t default_pack = !bundled_pack_path(1).empty() ? 1u : (!bundled_pack_path(2).empty() ? 2u : 0u);
++            config.add_enum_option(
++                graphics::options::texture_pack,
++                "Texture Pack",
++                "HD and UHD use the reworked artwork. UHD uses more video memory. Original uses the ROM textures. Render resolution is set separately.",
++                { {0u, "Original", "Original"}, {1u, "HD", "40 Winks HD"}, {2u, "UHD", "40 Winks UHD"} },
++                default_pack
++            );
++            config.update_enum_option_disabled(graphics::options::texture_pack, 1u, bundled_pack_path(1).empty());
++            config.update_enum_option_disabled(graphics::options::texture_pack, 2u, bundled_pack_path(2).empty());
++
+             config.add_enum_option(
+                 graphics::options::res_option,
+-                "Resolution",
+-                "Sets the output resolution of the game. <recomp-color primary>Original</recomp-color> matches the game's original 240p resolution. <recomp-color primary>Original 2x</recomp-color> will render at 480p. <recomp-color primary>Auto</recomp-color> will scale based on the game window's resolution.",
++                "Render Resolution",
++                "<b>Auto</b> scales to the game window. Full HD, WQHD and 4K UHD render at 1080p, 1440p and 2160p. Original and Original 2x render at 240p and 480p.",
+                 resolution_options,
+-                ultramodern::renderer::Resolution::Original // 40winks default (was Auto)
++                ultramodern::renderer::Resolution::Auto
+             );
+             {
+                 config.add_option_change_callback(
+@@ -252,6 +290,29 @@ namespace recompui {
+                 );
+             }
+ 
++            config.add_enum_option(
++                graphics::options::ar_option,
++                "Aspect Ratio",
++                "Sets the horizontal aspect ratio. <recomp-color primary>Original</recomp-color> uses the game's original 4:3 aspect ratio. <recomp-color primary>Expand</recomp-color> will adjust to match the game window's aspect ratio.",
++                aspect_ratio_options,
++                ultramodern::renderer::AspectRatio::Expand
++            );
++
++            config.add_enum_option(
++                graphics::options::wm_option,
++                "Display Mode",
++                "Choose a resizable window, fullscreen, or borderless fullscreen at the desktop resolution.",
++                window_mode_options,
++                ultramodern::renderer::WindowMode::Fullscreen // 40winks default (was wm_default(): windowed off Steam Deck)
++            );
++
++            config.add_bool_option(
++                graphics::options::advanced_graphics,
++                "Advanced Graphics",
++                "Show image filtering, anti-aliasing, frame rate and other rendering options.",
++                false
++            );
++
+             config.add_enum_option(
+                 graphics::options::ds_option,
+                 "Downsampling Quality",
+@@ -271,14 +332,19 @@ namespace recompui {
+                     }
+                 );
+ 
+-                config.add_option_disable_dependency(
+-                    graphics::options::ds_option,
+-                    graphics::options::res_option,
+-                    ultramodern::renderer::Resolution::Auto
+-                );
++                using ultramodern::renderer::Resolution;
++                for (auto resolution : {Resolution::Auto, Resolution::FullHD, Resolution::WQHD, Resolution::UHD}) {
++                    config.add_option_disable_dependency(graphics::options::ds_option, graphics::options::res_option, resolution);
++                }
+     
+-                config.on_json_parse_option(graphics::options::ds_option, [](const nlohmann::json& j) {
+-                    return j.get<uint32_t>();
++                config.on_json_parse_option(graphics::options::ds_option, [](const nlohmann::json& value) {
++                    if (value == 2) {
++                        return uint32_t(DownsamplingOption::X2);
++                    }
++                    if (value == 4) {
++                        return uint32_t(DownsamplingOption::X4);
++                    }
++                    return uint32_t(DownsamplingOption::Off);
+                 });
+     
+                 config.on_json_serialize_option(graphics::options::ds_option, [](const recomp::config::ConfigValueVariant& value) {
+@@ -286,22 +352,6 @@ namespace recompui {
+                 });
+             }
+ 
+-            config.add_enum_option(
+-                graphics::options::ar_option,
+-                "Aspect Ratio",
+-                "Sets the horizontal aspect ratio. <recomp-color primary>Original</recomp-color> uses the game's original 4:3 aspect ratio. <recomp-color primary>Expand</recomp-color> will adjust to match the game window's aspect ratio.",
+-                aspect_ratio_options,
+-                ultramodern::renderer::AspectRatio::Original // 40winks default (was Expand)
+-            );
+-
+-            config.add_enum_option(
+-                graphics::options::wm_option,
+-                "Window Mode",
+-                "Sets whether the game should display <recomp-color primary>Windowed</recomp-color> or <recomp-color primary>Fullscreen</recomp-color>. You can also use <recomp-color primary>F11</recomp-color> or <recomp-color primary>Alt + Enter</recomp-color> to toggle this option.",
+-                window_mode_options,
+-                ultramodern::renderer::WindowMode::Fullscreen // 40winks default (was wm_default(): windowed off Steam Deck)
+-            );
+-
+             config.add_enum_option(
+                 graphics::options::rr_option,
+                 "Framerate",
+@@ -312,18 +362,15 @@ namespace recompui {
+ 
+             config.add_number_option(
+                 graphics::options::rr_manual_value,
+-                "",
++                "Target Framerate",
+                 get_framerate_text(60),
+                 20.0, 240.0, 1.0, 0, false, 60.0
+             );
+-            {
+-                config.add_option_hidden_dependency(
+-                    graphics::options::rr_manual_value,
+-                    graphics::options::rr_option,
+-                    ultramodern::renderer::RefreshRate::Original,
+-                    ultramodern::renderer::RefreshRate::Display
+-                );
+-            }
++            auto update_framerate = [](recomp::config::ConfigValueVariant, recomp::config::ConfigValueVariant, OptionChangeContext context) {
++                update_manual_framerate_visibility(context);
++            };
++            config.add_option_change_callback(graphics::options::rr_option, update_framerate);
++            config.add_option_change_callback(graphics::options::advanced_graphics, update_framerate);
+ 
+             config.add_enum_option(
+                 graphics::options::msaa_option,
+@@ -387,6 +434,15 @@ namespace recompui {
+                 0u // 40winks default: Original
+             );
+ 
++            for (const auto &id : {
++                    graphics::options::ds_option, graphics::options::rr_option,
++                    graphics::options::msaa_option,
++                    graphics::options::hr_option, graphics::options::hpfb_option,
++                    graphics::options::tf_option, graphics::options::of_option,
++                    graphics::options::u2d_option }) {
++                config.add_option_hidden_dependency(id, graphics::options::advanced_graphics, false);
++            }
++
+             return config;
+         }
+     }
+diff --git a/recompui/src/elements/ui_modal.cpp b/recompui/src/elements/ui_modal.cpp
+index 9f011c4..cd1f7c7 100644
+--- a/recompui/src/elements/ui_modal.cpp
++++ b/recompui/src/elements/ui_modal.cpp
+@@ -1,4 +1,5 @@
+ #include "ui_modal.h"
++#include "config/ui_settings_style.h"
+ #include "ui_element.h"
+ #include "ui_document.h"
+ #include "recompinput/recompinput.h"
+@@ -58,7 +59,11 @@ Modal::Modal(
+     set_bottom(0);
+     set_left(0);
+ 
++    const bool is_settings = modal_type == ModalType::Settings;
+     modal_overlay = context.create_element<ModalOverlay>(this);
++    if (is_settings) {
++        modal_overlay->set_background_color(settings_style::scrim);
++    }
+ 
+     // 40winks: empty layer behind the modal panel, for a game-specific background (get_background_holder).
+     background_holder = context.create_element<Element>(modal_overlay);
+@@ -96,6 +101,16 @@ Modal::Modal(
+     modal_element->set_as_navigation_container(NavigationType::Vertical);
+     modal_element->set_nav_wrapping(true);
+ 
++    if (is_settings) {
++        modal_element->set_max_width(settings_style::width);
++        modal_element->set_max_height(settings_style::height);
++        modal_element->set_border_width(1.0f);
++        modal_element->set_border_radius(settings_style::radius);
++        modal_element->set_border_color(settings_style::border);
++        modal_element->set_background_color(settings_style::panel);
++        modal_element->set_color(settings_style::text);
++    }
++
+     header = context.create_element<ConfigHeaderFooter>(modal_element, true);
+     header->set_padding_top(0.0f);
+     header->set_padding_bottom(0.0f);
+@@ -103,6 +118,12 @@ Modal::Modal(
+     header->set_padding_right(8.0f);
+     header->set_border_top_left_radius(theme::border::radius_lg);
+     header->set_border_top_right_radius(theme::border::radius_lg);
++    if (is_settings) {
++        header->set_background_color(theme::color::Transparent);
++        header->set_border_bottom_width(1.0f);
++        header->set_border_bottom_color(settings_style::divider);
++        header->set_padding_right(18.0f);
++    }
+ 
+     body = context.create_element<Element>(modal_element);
+     body->set_display(Display::Flex);
+@@ -167,7 +188,7 @@ bool TabbedModal::close() {
+ }
+ 
+ static std::pair<recompinput::InputDevice, int> get_last_input_info() {
+-    if (recompinput::players::is_single_player_mode()) {
++    if (recompinput::players::uses_default_input(0)) {
+         if (get_cont_active()) {
+             return { recompinput::InputDevice::Controller, recompinput::profiles::get_sp_controller_profile_index() };
+         } else {
+@@ -230,7 +251,8 @@ void Modal::render_menu_actions() {
+ 
+     ContextId context = get_current_context();
+     if (menu_actions_wrapper == nullptr) {
+-        menu_actions_wrapper = context.create_element<Element>(modal_overlay);
++        auto action_parent = modal_type == ModalType::Settings ? modal_element : modal_overlay;
++        menu_actions_wrapper = context.create_element<Element>(action_parent);
+         menu_actions_wrapper->set_position(Position::Absolute);
+         menu_actions_wrapper->set_bottom(0);
+         menu_actions_wrapper->set_margin_left_auto();
+@@ -244,6 +266,14 @@ void Modal::render_menu_actions() {
+         menu_actions_wrapper->set_justify_content(JustifyContent::FlexStart);
+         menu_actions_wrapper->set_align_items(AlignItems::Center);
+         menu_actions_wrapper->set_gap(32.0f);
++        if (modal_type == ModalType::Settings) {
++            // Anchor shortcuts just below the same panel in fullscreen and windowed mode.
++            menu_actions_wrapper->set_bottom(-52.0f);
++            menu_actions_wrapper->set_padding_left(8.0f);
++            menu_actions_wrapper->set_padding_right(8.0f);
++            menu_actions_wrapper->set_height(48.0f);
++            menu_actions_wrapper->set_gap(20.0f);
++        }
+     } else {
+         menu_actions_wrapper->clear_children();
+     }
+@@ -297,9 +327,10 @@ void Modal::render_menu_actions() {
+         action_wrapper->set_gap(4.0f);
+         action_wrapper->set_color(theme::color::TextA80);
+ 
+-        auto action_label = context.create_element<Label>(action_wrapper, action_info.description + ":", theme::Typography::LabelSM);
++        const auto hint_typography = modal_type == ModalType::Settings ? theme::Typography::LabelXS : theme::Typography::LabelSM;
++        auto action_label = context.create_element<Label>(action_wrapper, action_info.description + ":", hint_typography);
+         for (const auto &bound_input : bound_inputs) {
+-            auto binding_label = context.create_element<Label>(action_wrapper, bound_input.to_string(), theme::Typography::LabelSM);
++            auto binding_label = context.create_element<Label>(action_wrapper, bound_input.to_string(), hint_typography);
+             binding_label->set_font_family("promptfont");
+             binding_label->set_font_style(FontStyle::Normal);;
+             binding_label->set_font_weight(400);;
+diff --git a/recompui/src/elements/ui_modal.h b/recompui/src/elements/ui_modal.h
+index 7e16d5c..b638f08 100644
+--- a/recompui/src/elements/ui_modal.h
++++ b/recompui/src/elements/ui_modal.h
+@@ -14,6 +14,7 @@ namespace recompui {
+ 
+     enum class ModalType {
+         Fullscreen,
++        Settings,
+         Prompt
+     };
+ 
+diff --git a/recompui/src/elements/ui_radio.cpp b/recompui/src/elements/ui_radio.cpp
+index 0055ead..4d5f14c 100644
+--- a/recompui/src/elements/ui_radio.cpp
++++ b/recompui/src/elements/ui_radio.cpp
+@@ -1,6 +1,7 @@
+ #include "overloaded.h"
+ #include "ui_radio.h"
+ #include "ui_utils.h"
++#include "config/ui_settings_style.h"
+ 
+ namespace recompui {
+ 
+@@ -35,16 +36,31 @@ namespace recompui {
+         add_style(&disabled_style, { disabled_state });
+     }
+ 
+-    void RadioOption::use_game_text(std::string_view name) {
+-        enable_game_text();
+-        set_text(name);
+-        if (!is_game_text()) {
+-            return; // No game letters (no ROM yet): keep the plain text look.
+-        }
+-        set_opacity(0.55f);
+-        hover_style.set_opacity(0.8f);
+-        checked_style.set_opacity(1.0f);
+-        disabled_style.set_opacity(0.25f);
++    void RadioOption::use_settings_style() {
++        set_text_transform(TextTransform::None);
++        set_white_space(WhiteSpace::Nowrap);
++        set_font_size(18.0f);
++        set_line_height(22.0f);
++        set_font_weight(550);
++        set_letter_spacing(0.0f);
++        set_padding_top(8.0f);
++        set_padding_bottom(8.0f);
++        set_padding_left(12.0f);
++        set_padding_right(12.0f);
++        set_border_width(1.0f);
++        set_border_radius(8.0f);
++        set_background_color(settings_style::control);
++        set_border_color(settings_style::border);
++        set_color(settings_style::muted);
++
++        hover_style.set_background_color(settings_style::hovered);
++        hover_style.set_color(settings_style::text);
++        checked_style.set_background_color(settings_style::accent_background);
++        checked_style.set_border_color(settings_style::accent_border);
++        checked_style.set_color(settings_style::accent);
++        pulsing_style.set_border_color(settings_style::accent);
++        disabled_style.set_color(settings_style::subdued);
++        disabled_style.set_opacity(0.62f);
+         apply_styles();
+     }
+ 
+@@ -58,7 +74,6 @@ namespace recompui {
+ 
+     void RadioOption::set_selected_state(bool enable) {
+         set_style_enabled(checked_state, enable);
+-        set_rml_class("winks-checked", enable); // 40winks: yellow letters (assets/recomp.rcss)
+         set_as_primary_focus(enable);
+     }
+ 
+diff --git a/recompui/src/elements/ui_radio.h b/recompui/src/elements/ui_radio.h
+index 79de229..6d2a000 100644
+--- a/recompui/src/elements/ui_radio.h
++++ b/recompui/src/elements/ui_radio.h
+@@ -22,7 +22,7 @@ namespace recompui {
+         void set_focus_callback(std::function<void(bool)> callback);
+         void set_selected_state(bool enable);
+         // 40winks: game lettering; unselected entries are dimmed by opacity instead of text color.
+-        void use_game_text(std::string_view name);
++        void use_settings_style();
+     };
+ 
+     class Radio : public Container {
+diff --git a/recompui/src/elements/ui_select.cpp b/recompui/src/elements/ui_select.cpp
+index e289e9e..3830f15 100644
+--- a/recompui/src/elements/ui_select.cpp
++++ b/recompui/src/elements/ui_select.cpp
+@@ -1,4 +1,5 @@
+ #include "ui_select.h"
++#include "config/ui_settings_style.h"
+ #include "ui_pseudo_border.h"
+ #include "ui_label.h"
+ 
+@@ -13,7 +14,7 @@ namespace recompui {
+         ContextId context = get_current_context();
+         set_position(Position::Relative);
+ 
+-        auto label = context.create_element<Label>(this, option.text, theme::Typography::LabelXS);
++        label = context.create_element<Label>(this, option.text, theme::Typography::LabelXS);
+         label->set_padding_left(8.0f);
+         set_border_left_width(4.0f);
+         set_border_left_color(theme::color::Transparent);
+@@ -58,7 +59,6 @@ namespace recompui {
+         case EventType::Click:
+             break;
+         case EventType::Hover:
+-            printf("Option hovered: %s\n", option.text.c_str());
+             set_style_enabled(hover_state, std::get<EventHover>(e.variant).active && is_enabled());
+             break;
+         case EventType::Enable:
+@@ -86,6 +86,19 @@ namespace recompui {
+         }
+     }
+ 
++    void Option::use_settings_style() {
++        label->set_font_size(18.0f);
++        label->set_line_height(22.0f);
++        label->set_letter_spacing(0.0f);
++        set_color(settings_style::muted);
++        hover_style.set_background_color(settings_style::hovered);
++        focus_style.set_background_color(settings_style::hovered);
++        active_style.set_border_left_color(settings_style::accent);
++        active_style.set_color(settings_style::accent);
++        active_style.set_background_color(settings_style::accent_background);
++        apply_styles();
++    }
++
+     void Option::set_active(bool is_active) {
+         active = is_active;
+         set_style_enabled("active", active);
+@@ -106,7 +119,7 @@ namespace recompui {
+         Element(
+             rid,
+             parent,
+-            Events(EventType::Text, EventType::Click, EventType::Hover, EventType::Enable, EventType::Focus),
++            Events(EventType::Text, EventType::Click, EventType::Hover, EventType::Enable, EventType::Focus, EventType::Update),
+             "select",
+             false),
+         selected_option_value(selected_option_value)
+@@ -250,6 +263,9 @@ namespace recompui {
+             bool focus_active = std::get<EventFocus>(e.variant).active;
+             set_style_enabled(focus_state, focus_active);
+             wrapper->set_style_enabled(focus_state, focus_active);
++            if (focus_callback) {
++                focus_callback(focus_active);
++            }
+             break;
+         }
+         case EventType::Text:
+@@ -297,6 +313,39 @@ namespace recompui {
+         }
+     }
+ 
++    void Select::set_option_enabled(size_t index, bool enabled) {
++        if (index < option_elements.size()) {
++            option_elements[index]->set_enabled(enabled);
++        }
++    }
++
++    void Select::use_settings_style() {
++        set_font_size(19.0f);
++        set_line_height(24.0f);
++        set_letter_spacing(0.0f);
++        set_color(settings_style::text);
++        set_background_color(settings_style::control);
++        set_border_width(1.0f);
++        set_border_radius(8.0f);
++        set_border_color(settings_style::border);
++        hover_style.set_background_color(settings_style::hovered);
++        hover_style.set_border_color(settings_style::border);
++        focus_style.set_background_color(settings_style::hovered);
++        focus_style.set_border_color(settings_style::accent);
++        arrow->set_color(settings_style::muted);
++
++        auto selectbox = get_element_with_tag_name(select_element_selectbox);
++        selectbox.set_background_color(settings_style::inset);
++        selectbox.set_border_width(1.0f);
++        selectbox.set_border_color(settings_style::border);
++        selectbox.set_border_radius(8.0f);
++        for (auto *option : option_elements) {
++            option->use_settings_style();
++        }
++        apply_styles();
++        queue_update();
++    }
++
+     void Select::add_change_callback(std::function<void(SelectOption& option, int option_index)> callback) {
+         change_callbacks.emplace_back(callback);
+     }
+diff --git a/recompui/src/elements/ui_select.h b/recompui/src/elements/ui_select.h
+index cc4932c..256e966 100644
+--- a/recompui/src/elements/ui_select.h
++++ b/recompui/src/elements/ui_select.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "ui_element.h"
++#include "ui_label.h"
+ #include "ui_svg.h"
+ 
+ 
+@@ -31,7 +32,7 @@ namespace recompui {
+         Style focus_style;
+         Style disabled_style;
+         Style active_style;
+-        Element *active_indicator = nullptr;
++        Label *label = nullptr;
+         bool active = false;
+ 
+         // Element overrides.
+@@ -40,6 +41,7 @@ namespace recompui {
+     public:
+         Option(ResourceId rid, Element *parent, const SelectOption &option);
+         void set_active(bool is_active);
++        void use_settings_style();
+     };
+ 
+     // Note: Select element fills the available width of its parent element.
+@@ -51,6 +53,7 @@ namespace recompui {
+         Svg *arrow = nullptr;
+         std::vector<SelectOption> options;
+         std::vector<Option*> option_elements;
++        std::function<void(bool)> focus_callback;
+         bool is_open = false;
+ 
+         Style hover_style;
+@@ -71,6 +74,9 @@ namespace recompui {
+             std::string selected_option_value = ""
+         );
+         void add_change_callback(std::function<void(SelectOption& option, int option_index)> callback);
++        void set_option_enabled(size_t index, bool enabled);
++        void use_settings_style();
++        void set_focus_callback(std::function<void(bool)> callback) { focus_callback = std::move(callback); }
+         Style* get_hover_style() { return &hover_style; }
+         Style* get_focus_style() { return &focus_style; }
+         Style* get_disabled_style() { return &disabled_style; }
+diff --git a/recompui/src/elements/ui_tab_set.cpp b/recompui/src/elements/ui_tab_set.cpp
+index 4214f9d..05d60a2 100644
+--- a/recompui/src/elements/ui_tab_set.cpp
++++ b/recompui/src/elements/ui_tab_set.cpp
+@@ -1,5 +1,5 @@
+ #include "ui_tab_set.h"
+-#include "ui_utils.h"
++#include "config/ui_settings_style.h"
+ 
+ namespace recompui {
+ 
+@@ -20,33 +20,37 @@ Tab::Tab(ResourceId rid, Element *parent, int tab_index, std::string_view text,
+     set_tab_index_auto();
+     set_cursor(Cursor::Pointer);
+ 
+-    set_color(theme::color::TextInactive);
++    set_color(settings_style::muted);
+     set_background_color(theme::color::Transparent);
+-    set_opacity(1.0f);
++    set_white_space(WhiteSpace::Nowrap);
+ 
+-    hover_style.set_color(theme::color::WhiteA80);
+-    checked_style.set_color(theme::color::White);
+-    pulsing_style.set_color(theme::color::WhiteA80);
++    hover_style.set_color(settings_style::text);
++    hover_style.set_background_color(settings_style::control);
++    checked_style.set_color(settings_style::accent);
++    focus_style.set_background_color(settings_style::hovered);
+ 
+     disabled_style.set_cursor(Cursor::None);
+-    disabled_style.set_color(theme::color::TextDim);
+-    disabled_style.set_opacity(0.5f);
++    disabled_style.set_color(settings_style::subdued);
+ 
+     ContextId context = get_current_context();
+-    label = context.create_element<Label>(this, std::string{text}, theme::Typography::Header3);
++    label = context.create_element<Label>(this, std::string{text}, theme::Typography::Body);
++    label->set_font_size(20.0f);
++    label->set_line_height(24.0f);
++    label->set_font_weight(600);
+ 
+     indicator = context.create_element<Element>(this, 0, "div", false);
+     indicator->set_display(Display::Block);
+     indicator->set_position(Position::Absolute);
+     indicator->set_height(2.0f);
+-    indicator->set_bottom(2.0f);
+-    indicator->set_left(0.0f);
+-    indicator->set_right(0.0f);
++    indicator->set_bottom(0.0f);
++    indicator->set_left(tab_horizontal_padding);
++    indicator->set_right(tab_horizontal_padding);
++    indicator->set_border_radius(1.0f);
+     indicator->set_background_color(theme::color::Transparent);
+ 
+     add_style(&hover_style, { hover_state });
+     add_style(&checked_style, { checked_state });
+-    add_style(&pulsing_style, { focus_state });
++    add_style(&focus_style, { focus_state });
+     add_style(&disabled_style, { disabled_state });
+ }
+ 
+@@ -80,30 +84,11 @@ void Tab::process_event(const Event &e) {
+     case EventType::Enable: {
+         bool active = std::get<EventEnable>(e.variant).active;
+         set_style_enabled(disabled_state, !active);
+-        indicator->set_background_color(active ? theme::color::BorderSolid : theme::color::Transparent);
++        indicator->set_background_color(active && is_selected ? settings_style::accent : Color{0, 0, 0, 0});
+         break;
+     }
+     case EventType::Focus:
+-        {
+-            bool active = std::get<EventFocus>(e.variant).active;
+-            set_style_enabled(focus_state, active);
+-            if (active) {
+-                queue_update();
+-            }
+-        }
+-        break;
+-    case EventType::Update:
+-        if (is_style_enabled(focus_state)) {
+-            recompui::Color pulse_color = recompui::get_pulse_color(750);
+-            pulsing_style.set_color(pulse_color);
+-            if (is_selected) {
+-                indicator->set_background_color(pulse_color);
+-            } else {
+-                indicator->set_background_color(theme::color::Transparent);
+-            }
+-            apply_styles();
+-            queue_update();
+-        }
++        set_style_enabled(focus_state, std::get<EventFocus>(e.variant).active);
+         break;
+     default:
+         break;
+@@ -114,7 +99,7 @@ void Tab::set_selected(bool enable) {
+     is_selected = enable;
+     set_as_primary_focus(enable);
+     set_style_enabled(checked_state, enable);
+-    indicator->set_background_color(enable ? theme::color::BorderSolid : theme::color::Transparent);
++    indicator->set_background_color(enable ? settings_style::accent : Color{0, 0, 0, 0});
+ }
+ 
+ TabSet::TabSet(ResourceId rid, Element *parent) :
+diff --git a/recompui/src/elements/ui_tab_set.h b/recompui/src/elements/ui_tab_set.h
+index 0195fb0..513e188 100644
+--- a/recompui/src/elements/ui_tab_set.h
++++ b/recompui/src/elements/ui_tab_set.h
+@@ -11,7 +11,7 @@ namespace recompui {
+     private:
+         Style hover_style;
+         Style checked_style;
+-        Style pulsing_style;
++        Style focus_style;
+         Style disabled_style;
+         int tab_index;
+         bool is_selected = false;
+@@ -23,8 +23,8 @@ namespace recompui {
+         bool visible = true;
+         bool selectable = true;
+ 
+-        static constexpr float tab_vertical_padding = 20.0f;
+-        static constexpr float tab_horizontal_padding = 24.0f;
++        static constexpr float tab_vertical_padding = 24.0f;
++        static constexpr float tab_horizontal_padding = 18.0f;
+         static constexpr recompui::Display default_display_setting = Display::Block;
+     protected:
+         std::string_view get_type_name() override { return "Tab"; }
+diff --git a/recompui/src/renderer/rt64_render_context.cpp b/recompui/src/renderer/rt64_render_context.cpp
+index 6837946..9c09c45 100644
+--- a/recompui/src/renderer/rt64_render_context.cpp
++++ b/recompui/src/renderer/rt64_render_context.cpp
+@@ -43,7 +43,11 @@ struct TexturePackSecondaryDisableAction {
+ struct TexturePackUpdateAction {
+ };
+ 
+-using TexturePackAction = std::variant<TexturePackEnableAction, TexturePackDisableAction, TexturePackSecondaryEnableAction, TexturePackSecondaryDisableAction, TexturePackUpdateAction>;
++struct BundledTexturePackAction {
++    std::filesystem::path path;
++};
++
++using TexturePackAction = std::variant<TexturePackEnableAction, TexturePackDisableAction, TexturePackSecondaryEnableAction, TexturePackSecondaryDisableAction, TexturePackUpdateAction, BundledTexturePackAction>;
+ 
+ static moodycamel::ConcurrentQueue<TexturePackAction> texture_pack_action_queue;
+ 
+@@ -155,6 +159,17 @@ void set_application_user_config(RT64::Application* application, const ultramode
+             application->userConfig.resolutionMultiplier = 2.0 * std::max(config.ds_option, 1);
+             application->userConfig.downsampleMultiplier = std::max(config.ds_option, 1);
+             break;
++        case ultramodern::renderer::Resolution::FullHD:
++        case ultramodern::renderer::Resolution::WQHD:
++        case ultramodern::renderer::Resolution::UHD: {
++            using ultramodern::renderer::Resolution;
++            int height = config.res_option == Resolution::FullHD ? 1080 :
++                         config.res_option == Resolution::WQHD ? 1440 : 2160;
++            application->userConfig.resolution = RT64::UserConfiguration::Resolution::Manual;
++            application->userConfig.resolutionMultiplier = height / 240.0;
++            application->userConfig.downsampleMultiplier = 1;
++            break;
++        }
+     }
+ 
+     switch (config.hr_option) {
+@@ -278,7 +293,7 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+     app = std::make_unique<RT64::Application>(appCore, appConfig);
+ 
+     // Set initial user config settings based on the current settings.
+-    auto& cur_config = ultramodern::renderer::get_graphics_config();
++    const auto cur_config = ultramodern::renderer::get_graphics_config();
+     set_application_user_config(app.get(), cur_config);
+     app->userConfig.developerMode = debug;
+     // Force gbi depth branches to prevent LODs from kicking in.
+@@ -317,8 +332,9 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+         return;
+     }
+ 
+-    // Set the application's fullscreen state.
++#if !defined(_WIN32)
+     app->setFullScreen(cur_config.wm_option == ultramodern::renderer::WindowMode::Fullscreen);
++#endif
+ 
+     // Check if the selected device actually supports MSAA sample positions and MSAA for for the formats that will be used
+     // and downgrade the configuration accordingly.
+@@ -375,9 +391,11 @@ bool renderer::RT64Context::update_config(const ultramodern::renderer::GraphicsC
+         return false;
+     }
+ 
++#if !defined(_WIN32)
+     if (new_config.wm_option != old_config.wm_option) {
+         app->setFullScreen(new_config.wm_option == ultramodern::renderer::WindowMode::Fullscreen);
+     }
++#endif
+ 
+     set_application_user_config(app.get(), new_config);
+ 
+@@ -446,6 +464,12 @@ void renderer::RT64Context::check_texture_pack_actions() {
+             },
+             [&](TexturePackUpdateAction &) {
+                 packs_changed = true;
++            },
++            [&](BundledTexturePackAction &action) {
++                if (bundled_texture_pack != action.path) {
++                    bundled_texture_pack = std::move(action.path);
++                    packs_changed = true;
++                }
+             }
+         }, cur_action);
+     }
+@@ -469,16 +493,22 @@ void renderer::RT64Context::check_texture_pack_actions() {
+ 
+         // Build the path list from the sorted mod list.
+         std::vector<RT64::ReplacementDirectory> replacement_directories;
+-        replacement_directories.reserve(enabled_texture_packs.size());
++        replacement_directories.reserve(sorted_texture_packs.size() + 1);
++        if (!bundled_texture_pack.empty()) {
++            replacement_directories.emplace_back(bundled_texture_pack);
++        }
+         for (const std::string &mod_id : sorted_texture_packs) {
+             replacement_directories.emplace_back(RT64::ReplacementDirectory(recomp::mods::get_mod_filename(mod_id)));
+         }
+ 
+         if (!replacement_directories.empty()) {
+-            app->textureCache->loadReplacementDirectories(replacement_directories);
++            if (app->textureCache->loadReplacementDirectories(replacement_directories) && !bundled_texture_pack.empty()) {
++                fprintf(stdout, "[Textures] Using %s\n", bundled_texture_pack.filename().string().c_str());
++            }
+         }
+         else {
+             app->textureCache->clearReplacementDirectories();
++            fprintf(stdout, "[Textures] Using original textures\n");
+         }
+     }
+ }
+@@ -510,6 +540,10 @@ bool renderer::RT64HighPrecisionFBEnabled() {
+     return high_precision_fb_enabled;
+ }
+ 
++void renderer::set_bundled_texture_pack(std::filesystem::path path) {
++    texture_pack_action_queue.enqueue(BundledTexturePackAction{std::move(path)});
++}
++
+ void renderer::trigger_texture_pack_update() {
+     texture_pack_action_queue.enqueue(TexturePackUpdateAction{});
+ }

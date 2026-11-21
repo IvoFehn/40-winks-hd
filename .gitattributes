@@ -1,0 +1,4 @@
+*.patch -text
+*.png binary
+*.jpg binary
+*.ttf binary

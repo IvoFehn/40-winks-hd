@@ -1,0 +1,49 @@
+40 WINKS : DREAMCOMPILED
+Version 0.4.0
+========================
+
+Portage natif Windows et Linux du jeu N64 40 Winks, fait avec N64: Recompiled et RT64.
+Il ne contient AUCUNE donnée du jeu : il faut ta propre copie du jeu.
+Page du projet : https://github.com/DreaXer/40WinksRecomp
+
+ROM PRISE EN CHARGE
+-------------------
+Uniquement la version finale N64 de Piko Interactive (Europe) :
+  code N4WZ, SHA-1 282b97c6a6eb79535e618fc2651b6156fff65ea4
+
+COMMENT JOUER
+-------------
+1. Lance 40WinksRecompiled.exe (Windows), ou sous Linux ouvre un terminal dans ce dossier et lance
+   ./40WinksRecompiled (depuis ce dossier : il a besoin de assets/).
+2. Choisis ta ROM de 40 Winks quand c'est demandé (premier lancement seulement ; une mauvaise ROM est refusée
+   avec la raison).
+3. Lance le jeu depuis le launcher.
+Les réglages et les sauvegardes sont dans %LOCALAPPDATA%\40WinksRecompiled\ (Windows)
+ou ~/.config/40WinksRecompiled/ (Linux).
+
+Configuration : Windows 10/11 64 bits ou Linux x86-64, une carte graphique Direct3D 12 ou Vulkan 1.2 (Vulkan sous
+Linux), un processeur avec AVX. Linux demande aussi SDL2, GTK 3, FreeType, libcurl et le chargeur Vulkan
+(Ubuntu/Debian : sudo apt install libsdl2-2.0-0 libgtk-3-0 libfreetype6 libcurl4 libvulkan1).
+Si le jeu plante au démarrage, mets à jour les pilotes de ta carte graphique.
+
+ÉTAT ACTUEL
+-----------
+Les mondes 1 et 2 (avec son boss) ont été joués en entier sans bug. Les mondes suivants ne sont pas encore testés.
+Garde une copie de tes sauvegardes.
+
+PROBLÈMES CONNUS
+----------------
+* Seuls les mondes 1 et 2 sont entièrement testés.
+* Les fondus (transitions) restent à 25 images par seconde.
+* Quelques options du launcher sont grisées (volume principal, API graphique, mods).
+
+SIGNALER UN BUG
+---------------
+https://github.com/DreaXer/40WinksRecomp/issues
+Indique : la version, ta version de Windows ou ta distribution Linux, l'endroit, ce que tu faisais juste avant, ce qui s'est passé (capture si
+possible), tes réglages Framerate et Aspect Ratio, et pour un plantage le fichier 40winks-log.txt à côté de l'exécutable
+(sous Linux, dans le dossier d'où tu l'as lancé).
+
+LICENCE
+-------
+GPL-3.0 (voir LICENSE). 40 Winks appartient à ses ayants droit ; ce projet n'a aucun lien avec eux.

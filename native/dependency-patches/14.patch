@@ -1,0 +1,1510 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 79dfc38..0843d3f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -359,6 +359,7 @@ set (SOURCES
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_projection.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_rdp.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_rdp_tmem.cpp"
++    "${PROJECT_SOURCE_DIR}/src/hle/rt64_rice_hash.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_rigid_body.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_rsp.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_state.cpp"
+diff --git a/src/common/rt64_replacement_database.cpp b/src/common/rt64_replacement_database.cpp
+index 9f331c9..7bf7244 100644
+--- a/src/common/rt64_replacement_database.cpp
++++ b/src/common/rt64_replacement_database.cpp
+@@ -1,410 +1,423 @@
+-//
+-// RT64
+-//
+-
+-#include "rt64_replacement_database.h"
+-
+-#include <cinttypes>
+-
+-#include "rt64_filesystem_directory.h"
+-
+-namespace RT64 {
+-    const std::string ReplacementDatabaseFilename = "rt64.json";
+-    const std::string ReplacementLowMipCacheFilename = "rt64-low-mip-cache.bin";
+-    const std::string ReplacementPackExtension = ".rtz";
+-    const std::string ReplacementKnownExtensions[] = { ".dds", ".png" };
+-    const uint32_t ReplacementMipmapCacheHeaderMagic = 0x434D4F4CU;
+-    const uint32_t ReplacementMipmapCacheHeaderVersion = 3U;
+-    
+-    static bool checkWildcard(const std::string &str, const std::string &pat) {
+-        size_t strIndex = 0;
+-        size_t patIndex = 0;
+-        size_t wildcardIndex = std::string::npos;
+-        size_t matchIndex = std::string::npos;
+-        while (strIndex < str.size()) {
+-            // Characters match or pattern indicates any character here. Advance both cursors.
+-            if ((patIndex < pat.size()) && ((pat[patIndex] == '?') || (str[strIndex] == pat[patIndex]))) {
+-                strIndex++;
+-                patIndex++;
+-            }
+-            // Pattern indicates a wildcard. The match is accepted.
+-            else if ((patIndex < pat.size()) && (pat[patIndex] == '*')) {
+-                wildcardIndex = patIndex;
+-                matchIndex = strIndex;
+-                patIndex++;
+-            }
+-            // There's a match active.
+-            else if (wildcardIndex != std::string::npos) {
+-                assert(matchIndex != std::string::npos);
+-                matchIndex++;
+-                patIndex = wildcardIndex + 1;
+-                strIndex = matchIndex;
+-            }
+-            // It doesn't match and there's no wildcard, reject the match.
+-            else {
+-                return false;
+-            }
+-        }
+-
+-        // Check if the rest of the pattern consists of wildcards.
+-        while ((patIndex < pat.size()) && (pat[patIndex] == '*')) {
+-            patIndex++;
+-        }
+-
+-        // The match is accepted if we reached the end of the pattern.
+-        return (patIndex == pat.size());
+-    }
+-
+-    // ReplacementDatabase
+-
+-    uint32_t ReplacementDatabase::addReplacement(const ReplacementTexture &texture) {
+-        const uint64_t rt64 = stringToHash(texture.hashes.rt64);
+-        auto it = tmemHashToReplaceMap.find(rt64);
+-        if (it != tmemHashToReplaceMap.end()) {
+-            textures[it->second] = texture;
+-            return it->second;
+-        }
+-        else {
+-            uint32_t textureIndex = uint32_t(textures.size());
+-            tmemHashToReplaceMap[rt64] = textureIndex;
+-            textures.emplace_back(texture);
+-            return textureIndex;
+-        }
+-    }
+-
+-    void ReplacementDatabase::fixReplacement(const std::string &hash, const ReplacementTexture &texture) {
+-        const uint64_t rt64Old = stringToHash(hash);
+-        const uint64_t rt64New = stringToHash(texture.hashes.rt64);
+-        auto it = tmemHashToReplaceMap.find(rt64Old);
+-        if (it != tmemHashToReplaceMap.end()) {
+-            textures[it->second] = texture;
+-            tmemHashToReplaceMap[rt64New] = it->second;
+-            tmemHashToReplaceMap.erase(it);
+-        }
+-    }
+-
+-    ReplacementTexture ReplacementDatabase::getReplacement(uint64_t hash) const {
+-        auto it = tmemHashToReplaceMap.find(hash);
+-        if (it != tmemHashToReplaceMap.end()) {
+-            return textures[it->second];
+-        }
+-        else {
+-            return ReplacementTexture();
+-        }
+-    }
+-
+-    ReplacementTexture ReplacementDatabase::getReplacement(const std::string &hash) const {
+-        return getReplacement(stringToHash(hash));
+-    }
+-
+-    void ReplacementDatabase::buildHashMaps() {
+-        tmemHashToReplaceMap.clear();
+-
+-        for (uint32_t i = 0; i < textures.size(); i++) {
+-            const ReplacementTexture &texture = textures[i];
+-            if (!texture.hashes.rt64.empty()) {
+-                const uint64_t rt64 = stringToHash(texture.hashes.rt64);
+-                tmemHashToReplaceMap[rt64] = i;
+-            }
+-        }
+-    }
+-
+-    ReplacementOperation ReplacementDatabase::resolveOperation(const std::string &relativePath, ReplacementOperation operation) {
+-        if (operation == ReplacementOperation::Auto) {
+-            ReplacementOperation resolution = config.defaultOperation;
+-
+-            // Resolve all filters in the order they appear in the database.
+-            for (const ReplacementOperationFilter &filter : operationFilters) {
+-                if (checkWildcard(relativePath, filter.wildcard)) {
+-                    resolution = filter.operation;
+-                }
+-            }
+-
+-            return resolution;
+-        }
+-        else {
+-            return operation;
+-        }
+-    }
+-
+-    ReplacementShift ReplacementDatabase::resolveShift(const std::string &relativePath, ReplacementShift shift) {
+-        if (shift == ReplacementShift::Auto) {
+-            ReplacementShift resolution = config.defaultShift;
+-
+-            // Resolve all filters in the order they appear in the database.
+-            for (const ReplacementShiftFilter &filter : shiftFilters) {
+-                if (checkWildcard(relativePath, filter.wildcard)) {
+-                    resolution = filter.shift;
+-                }
+-            }
+-
+-            return resolution;
+-        }
+-        else {
+-            return shift;
+-        }
+-    }
+-    
+-    void ReplacementDatabase::resolvePaths(const FileSystem *fileSystem, uint32_t fileSystemIndex, std::unordered_map<uint64_t, ReplacementResolvedPath> &resolvedPathMap, bool onlyDDS, std::vector<uint64_t> *hashesMissing, std::unordered_set<std::string> *pathsToPreload) {
+-        std::unordered_map<std::string, std::string> autoPathMap;
+-        for (const std::string &relativePath : *fileSystem) {
+-            const std::filesystem::path relativePathFs = std::filesystem::u8path(relativePath);
+-            std::string fileExtension = toLower(relativePathFs.extension().u8string());
+-            if (!isExtensionKnown(fileExtension)) {
+-                continue;
+-            }
+-
+-            std::string fileName = relativePathFs.filename().u8string();
+-            if (config.autoPath == ReplacementAutoPath::Rice) {
+-                size_t firstHashSymbol = fileName.find_first_of("#");
+-                size_t lastUnderscoreSymbol = fileName.find_last_of("_");
+-                if ((firstHashSymbol != std::string::npos) && (lastUnderscoreSymbol != std::string::npos) && (lastUnderscoreSymbol > firstHashSymbol)) {
+-                    std::string riceHash = toLower(fileName.substr(firstHashSymbol + 1, lastUnderscoreSymbol - firstHashSymbol - 1));
+-                    autoPathMap[riceHash] = FileSystem::toForwardSlashes(relativePath);
+-                }
+-            }
+-            else if (config.autoPath == ReplacementAutoPath::RT64) {
+-                size_t firstDotSymbol = fileName.find_first_of(".");
+-                if (firstDotSymbol != std::string::npos) {
+-                    std::string rt64Hash = toLower(fileName.substr(0, firstDotSymbol));
+-                    autoPathMap[rt64Hash] = FileSystem::toForwardSlashes(relativePath);
+-                }
+-            }
+-        }
+-
+-        auto addResolvedPath = [&](uint64_t hash, const std::string &relativePath, ReplacementOperation operation, ReplacementShift shift) {
+-            // Do not modify the entry if it's already in the map.
+-            if (resolvedPathMap.find(hash) != resolvedPathMap.end()) {
+-                return;
+-            }
+-
+-            ReplacementResolvedPath &resolvedPath = resolvedPathMap[hash];
+-            resolvedPath.fileSystemIndex = fileSystemIndex;
+-            resolvedPath.textureHash = hash;
+-            resolvedPath.relativePath = relativePath;
+-            resolvedPath.originalOperation = operation;
+-            resolvedPath.originalShift = shift;
+-            resolvedPath.resolvedOperation = resolveOperation(relativePath, operation);
+-            resolvedPath.resolvedShift = resolveShift(relativePath, shift);
+-
+-            if ((resolvedPath.resolvedOperation == ReplacementOperation::Preload) && (pathsToPreload != nullptr)) {
+-                pathsToPreload->insert(relativePath);
+-            }
+-        };
+-
+-        // Assign paths to all entries in the database.
+-        // If the entry already has a relative path, look for textures with extensions that are valid.
+-        // If the entry doesn't have a path but uses auto-path logic, then it'll try to resolve the path using that scheme.
+-        uint32_t textureIndex = 0;
+-        for (const ReplacementTexture &texture : textures) {
+-            if (!texture.path.empty()) {
+-                uint64_t hashRT64 = ReplacementDatabase::stringToHash(texture.hashes.rt64);
+-                std::string relativePath = FileSystem::toForwardSlashes(texture.path);
+-                std::string relativePathBase = removeKnownExtension(relativePath);
+-                bool fileExists = false;
+-                for (uint32_t i = 0; i < std::size(ReplacementKnownExtensions); i++) {
+-                    const std::string relativePathKnown = relativePathBase + ReplacementKnownExtensions[i];
+-                    std::string canonicalPath = fileSystem->makeCanonical(relativePathKnown);
+-                    if (!canonicalPath.empty() && fileSystem->exists(canonicalPath)) {
+-                        if (!onlyDDS || (i == 0)) {
+-                            std::string relativePathFinal = FileSystem::toForwardSlashes(canonicalPath);
+-                            addResolvedPath(hashRT64, relativePathFinal, texture.operation, texture.shift);
+-                        }
+-
+-                        fileExists = true;
+-                        break;
+-                    }
+-                }
+-
+-                if (!fileExists && (hashesMissing != nullptr)) {
+-                    hashesMissing->emplace_back(hashRT64);
+-                }
+-            }
+-            else {
+-                // Assign the correct hash as the search string.
+-                std::string searchString;
+-                if (config.autoPath == ReplacementAutoPath::Rice) {
+-                    searchString = texture.hashes.rice;
+-                }
+-                else if (config.autoPath == ReplacementAutoPath::RT64) {
+-                    searchString = texture.hashes.rt64;
+-                }
+-
+-                // Find in the auto path map the entry.
+-                auto it = autoPathMap.find(searchString);
+-                if (it != autoPathMap.end()) {
+-                    uint64_t hashRT64 = ReplacementDatabase::stringToHash(texture.hashes.rt64);
+-                    addResolvedPath(hashRT64, it->second, texture.operation, texture.shift);
+-                }
+-            }
+-
+-            textureIndex++;
+-        }
+-    }
+-
+-    void ReplacementDatabase::resolveOperations(std::unordered_map<uint64_t, ReplacementResolvedPath> &resolvedPathMap) {
+-        for (auto &it : resolvedPathMap) {
+-            it.second.resolvedOperation = resolveOperation(it.second.relativePath, it.second.originalOperation);
+-        }
+-    }
+-
+-    void ReplacementDatabase::resolveShifts(std::unordered_map<uint64_t, ReplacementResolvedPath> &resolvedPathMap) {
+-        for (auto &it : resolvedPathMap) {
+-            it.second.resolvedShift = resolveShift(it.second.relativePath, it.second.originalShift);
+-        }
+-    }
+-
+-    uint64_t ReplacementDatabase::stringToHash(const std::string &str) {
+-        return strtoull(str.c_str(), nullptr, 16);
+-    }
+-
+-    std::string ReplacementDatabase::hashToString(uint32_t hash) {
+-        char hexStr[32];
+-        snprintf(hexStr, sizeof(hexStr), "%08x", hash);
+-        return std::string(hexStr);
+-    }
+-
+-    std::string ReplacementDatabase::hashToString(uint64_t hash) {
+-        char hexStr[32];
+-        snprintf(hexStr, sizeof(hexStr), "%016" PRIx64, hash);
+-        return std::string(hexStr);
+-    }
+-
+-    bool ReplacementDatabase::isExtensionKnown(const std::string &extension) {
+-        uint32_t knownExtensionCount = std::size(ReplacementKnownExtensions);
+-        for (uint32_t i = 0; i < knownExtensionCount; i++) {
+-            if (extension == ReplacementKnownExtensions[i]) {
+-                return true;
+-            }
+-        }
+-
+-        return false;
+-    }
+-
+-    bool ReplacementDatabase::endsWith(const std::string &str, const std::string &end) {
+-        if (str.length() >= end.length()) {
+-            return (str.compare(str.length() - end.length(), end.length(), end) == 0);
+-        }
+-        else {
+-            return false;
+-        }
+-    }
+-
+-    std::string ReplacementDatabase::toLower(std::string str) {
+-        std::transform(str.begin(), str.end(), str.begin(), [](unsigned char c) { return std::tolower(c); });
+-        return str;
+-    };
+-
+-    std::string ReplacementDatabase::removeKnownExtension(const std::string &path) {
+-        const std::string lowerCasePath = toLower(path);
+-        for (uint32_t i = 0; i < std::size(ReplacementKnownExtensions); i++) {
+-            if (endsWith(lowerCasePath, ReplacementKnownExtensions[i])) {
+-                return path.substr(0, path.size() - ReplacementKnownExtensions[i].size());
+-            }
+-        }
+-
+-        return path;
+-    }
+-
+-    void to_json(json &j, const ReplacementConfiguration &config) {
+-        // Always update the configuration version to the latest one when saving.
+-        ReplacementConfiguration defaultConfig;
+-        j["configurationVersion"] = defaultConfig.configurationVersion;
+-        j["autoPath"] = config.autoPath;
+-        j["defaultOperation"] = config.defaultOperation;
+-        j["defaultShift"] = config.defaultShift;
+-        j["hashVersion"] = config.hashVersion;
+-    }
+-
+-    void from_json(const json &j, ReplacementConfiguration &config) {
+-        ReplacementConfiguration defaultConfig;
+-        config.configurationVersion = j.value("configurationVersion", 1);
+-
+-        // Shift defaults to none to texture packs made with versions previous to 3, which introduced a different default for shifting.
+-        ReplacementShift defaultShift = (config.configurationVersion < 3) ? ReplacementShift::None : defaultConfig.defaultShift;
+-        config.autoPath = j.value("autoPath", defaultConfig.autoPath);
+-        config.defaultOperation = j.value("defaultOperation", defaultConfig.defaultOperation);
+-        config.defaultShift = j.value("defaultShift", defaultShift);
+-        config.hashVersion = j.value("hashVersion", 1);
+-    }
+-
+-    void to_json(json &j, const ReplacementHashes &hashes) {
+-        j["rt64"] = hashes.rt64;
+-        j["rice"] = hashes.rice;
+-    }
+-    
+-    void from_json(const json &j, ReplacementHashes &hashes) {
+-        ReplacementHashes defaultHashes;
+-
+-        // First version of the replacement database specified the hash version directly in the key name.
+-        // Later versions choose to keep the version global to the file and make RT64 the unique key.
+-        hashes.rt64 = j.value("rt64v1", defaultHashes.rt64);
+-        hashes.rt64 = j.value("rt64", hashes.rt64);
+-        hashes.rice = j.value("rice", defaultHashes.rice);
+-    }
+-
+-    void to_json(json &j, const ReplacementTexture &texture) {
+-        ReplacementTexture defaultTexture;
+-        j["path"] = texture.path;
+-        j["hashes"] = texture.hashes;
+-
+-        if (texture.operation != defaultTexture.operation) {
+-            j["operation"] = texture.operation;
+-        }
+-
+-        if (texture.shift != defaultTexture.shift) {
+-            j["shift"] = texture.shift;
+-        }
+-    }
+-
+-    void from_json(const json &j, ReplacementTexture &texture) {
+-        ReplacementTexture defaultTexture;
+-        texture.path = j.value("path", defaultTexture.path);
+-        texture.hashes = j.value("hashes", defaultTexture.hashes);
+-        texture.operation = j.value("operation", defaultTexture.operation);
+-        texture.shift = j.value("shift", defaultTexture.shift);
+-    }
+-
+-    void to_json(json &j, const ReplacementOperationFilter &operationFilter) {
+-        j["wildcard"] = operationFilter.wildcard;
+-        j["operation"] = operationFilter.operation;
+-    }
+-
+-    void from_json(const json &j, ReplacementOperationFilter &operationFilter) {
+-        ReplacementOperationFilter defaultFilter;
+-        operationFilter.wildcard = FileSystem::toForwardSlashes(j.value("wildcard", defaultFilter.wildcard));
+-        operationFilter.operation = j.value("operation", defaultFilter.operation);
+-    }
+-
+-    void to_json(json &j, const ReplacementShiftFilter &shiftFilter) {
+-        j["wildcard"] = shiftFilter.wildcard;
+-        j["operation"] = shiftFilter.shift;
+-    }
+-
+-    void from_json(const json &j, ReplacementShiftFilter &shiftFilter) {
+-        ReplacementShiftFilter defaultFilter;
+-        shiftFilter.wildcard = FileSystem::toForwardSlashes(j.value("wildcard", defaultFilter.wildcard));
+-        shiftFilter.shift = j.value("shift", defaultFilter.shift);
+-    }
+-
+-    void to_json(json &j, const ReplacementDatabase &db) {
+-        j["configuration"] = db.config;
+-        j["textures"] = db.textures;
+-        j["operationFilters"] = db.operationFilters;
+-        j["shiftFilters"] = db.shiftFilters;
+-        j["extraFiles"] = db.extraFiles;
+-    }
+-
+-    void from_json(const json &j, ReplacementDatabase &db) {
+-        ReplacementConfiguration defaultConfig;
+-        db.config = j.value("configuration", defaultConfig);
+-        db.textures = j.value("textures", std::vector<ReplacementTexture>());
+-        db.operationFilters = j.value("operationFilters", std::vector<ReplacementOperationFilter>());
+-        db.shiftFilters = j.value("shiftFilters", std::vector<ReplacementShiftFilter>());
+-        db.extraFiles = j.value("extraFiles", std::vector<std::string>());
+-        db.buildHashMaps();
+-
+-        // Update configuration version to the latest one after parsing is over.
+-        db.config.configurationVersion = defaultConfig.configurationVersion;
+-    }
++//
++// RT64
++//
++
++#include "rt64_replacement_database.h"
++
++#include <cinttypes>
++
++#include "rt64_filesystem_directory.h"
++
++namespace RT64 {
++    const std::string ReplacementDatabaseFilename = "rt64.json";
++    const std::string ReplacementLowMipCacheFilename = "rt64-low-mip-cache.bin";
++    const std::string ReplacementPackExtension = ".rtz";
++    const std::string ReplacementKnownExtensions[] = { ".dds", ".png" };
++    const uint32_t ReplacementMipmapCacheHeaderMagic = 0x434D4F4CU;
++    const uint32_t ReplacementMipmapCacheHeaderVersion = 3U;
++    
++    static bool checkWildcard(const std::string &str, const std::string &pat) {
++        size_t strIndex = 0;
++        size_t patIndex = 0;
++        size_t wildcardIndex = std::string::npos;
++        size_t matchIndex = std::string::npos;
++        while (strIndex < str.size()) {
++            // Characters match or pattern indicates any character here. Advance both cursors.
++            if ((patIndex < pat.size()) && ((pat[patIndex] == '?') || (str[strIndex] == pat[patIndex]))) {
++                strIndex++;
++                patIndex++;
++            }
++            // Pattern indicates a wildcard. The match is accepted.
++            else if ((patIndex < pat.size()) && (pat[patIndex] == '*')) {
++                wildcardIndex = patIndex;
++                matchIndex = strIndex;
++                patIndex++;
++            }
++            // There's a match active.
++            else if (wildcardIndex != std::string::npos) {
++                assert(matchIndex != std::string::npos);
++                matchIndex++;
++                patIndex = wildcardIndex + 1;
++                strIndex = matchIndex;
++            }
++            // It doesn't match and there's no wildcard, reject the match.
++            else {
++                return false;
++            }
++        }
++
++        // Check if the rest of the pattern consists of wildcards.
++        while ((patIndex < pat.size()) && (pat[patIndex] == '*')) {
++            patIndex++;
++        }
++
++        // The match is accepted if we reached the end of the pattern.
++        return (patIndex == pat.size());
++    }
++
++    // ReplacementDatabase
++
++    uint32_t ReplacementDatabase::addReplacement(const ReplacementTexture &texture) {
++        const uint64_t rt64 = stringToHash(texture.hashes.rt64);
++        auto it = tmemHashToReplaceMap.find(rt64);
++        if (it != tmemHashToReplaceMap.end()) {
++            textures[it->second] = texture;
++            return it->second;
++        }
++        else {
++            uint32_t textureIndex = uint32_t(textures.size());
++            tmemHashToReplaceMap[rt64] = textureIndex;
++            textures.emplace_back(texture);
++            return textureIndex;
++        }
++    }
++
++    void ReplacementDatabase::fixReplacement(const std::string &hash, const ReplacementTexture &texture) {
++        const uint64_t rt64Old = stringToHash(hash);
++        const uint64_t rt64New = stringToHash(texture.hashes.rt64);
++        auto it = tmemHashToReplaceMap.find(rt64Old);
++        if (it != tmemHashToReplaceMap.end()) {
++            textures[it->second] = texture;
++            tmemHashToReplaceMap[rt64New] = it->second;
++            tmemHashToReplaceMap.erase(it);
++        }
++    }
++
++    ReplacementTexture ReplacementDatabase::getReplacement(uint64_t hash) const {
++        auto it = tmemHashToReplaceMap.find(hash);
++        if (it != tmemHashToReplaceMap.end()) {
++            return textures[it->second];
++        }
++        else {
++            return ReplacementTexture();
++        }
++    }
++
++    ReplacementTexture ReplacementDatabase::getReplacement(const std::string &hash) const {
++        return getReplacement(stringToHash(hash));
++    }
++
++    void ReplacementDatabase::buildHashMaps() {
++        tmemHashToReplaceMap.clear();
++
++        for (uint32_t i = 0; i < textures.size(); i++) {
++            const ReplacementTexture &texture = textures[i];
++            if (!texture.hashes.rt64.empty()) {
++                const uint64_t rt64 = stringToHash(texture.hashes.rt64);
++                tmemHashToReplaceMap[rt64] = i;
++            }
++        }
++    }
++
++    ReplacementOperation ReplacementDatabase::resolveOperation(const std::string &relativePath, ReplacementOperation operation) {
++        if (operation == ReplacementOperation::Auto) {
++            ReplacementOperation resolution = config.defaultOperation;
++
++            // Resolve all filters in the order they appear in the database.
++            for (const ReplacementOperationFilter &filter : operationFilters) {
++                if (checkWildcard(relativePath, filter.wildcard)) {
++                    resolution = filter.operation;
++                }
++            }
++
++            return resolution;
++        }
++        else {
++            return operation;
++        }
++    }
++
++    ReplacementShift ReplacementDatabase::resolveShift(const std::string &relativePath, ReplacementShift shift) {
++        if (shift == ReplacementShift::Auto) {
++            ReplacementShift resolution = config.defaultShift;
++
++            // Resolve all filters in the order they appear in the database.
++            for (const ReplacementShiftFilter &filter : shiftFilters) {
++                if (checkWildcard(relativePath, filter.wildcard)) {
++                    resolution = filter.shift;
++                }
++            }
++
++            return resolution;
++        }
++        else {
++            return shift;
++        }
++    }
++    
++    void ReplacementDatabase::resolvePaths(const FileSystem *fileSystem, uint32_t fileSystemIndex, std::unordered_map<uint64_t, ReplacementResolvedPath> &resolvedPathMap, bool onlyDDS, std::vector<uint64_t> *hashesMissing, std::unordered_set<std::string> *pathsToPreload, std::unordered_map<std::string, ReplacementResolvedPath> *ricePathMap) {
++        std::unordered_map<std::string, std::string> autoPathMap;
++        for (const std::string &relativePath : *fileSystem) {
++            const std::filesystem::path relativePathFs = std::filesystem::u8path(relativePath);
++            std::string fileExtension = toLower(relativePathFs.extension().u8string());
++            if (!isExtensionKnown(fileExtension)) {
++                continue;
++            }
++
++            std::string fileName = relativePathFs.filename().u8string();
++            if (config.autoPath == ReplacementAutoPath::Rice) {
++                size_t firstHashSymbol = fileName.find_first_of("#");
++                size_t lastUnderscoreSymbol = fileName.find_last_of("_");
++                if ((firstHashSymbol != std::string::npos) && (lastUnderscoreSymbol != std::string::npos) && (lastUnderscoreSymbol > firstHashSymbol)) {
++                    std::string riceHash = toLower(fileName.substr(firstHashSymbol + 1, lastUnderscoreSymbol - firstHashSymbol - 1));
++                    autoPathMap[riceHash] = FileSystem::toForwardSlashes(relativePath);
++                }
++            }
++            else if (config.autoPath == ReplacementAutoPath::RT64) {
++                size_t firstDotSymbol = fileName.find_first_of(".");
++                if (firstDotSymbol != std::string::npos) {
++                    std::string rt64Hash = toLower(fileName.substr(0, firstDotSymbol));
++                    autoPathMap[rt64Hash] = FileSystem::toForwardSlashes(relativePath);
++                }
++            }
++        }
++
++        if ((ricePathMap != nullptr) && (config.autoPath == ReplacementAutoPath::Rice)) {
++            const ReplacementTexture defaultTexture;
++            for (const auto &[riceHash, relativePath] : autoPathMap) {
++                ReplacementResolvedPath &resolvedPath = (*ricePathMap)[riceHash];
++                resolvedPath.fileSystemIndex = fileSystemIndex;
++                resolvedPath.relativePath = relativePath;
++                resolvedPath.originalOperation = defaultTexture.operation;
++                resolvedPath.originalShift = defaultTexture.shift;
++                resolvedPath.resolvedOperation = resolveOperation(relativePath, defaultTexture.operation);
++                resolvedPath.resolvedShift = resolveShift(relativePath, defaultTexture.shift);
++            }
++        }
++
++        auto addResolvedPath = [&](uint64_t hash, const std::string &relativePath, ReplacementOperation operation, ReplacementShift shift) {
++            // Do not modify the entry if it's already in the map.
++            if (resolvedPathMap.find(hash) != resolvedPathMap.end()) {
++                return;
++            }
++
++            ReplacementResolvedPath &resolvedPath = resolvedPathMap[hash];
++            resolvedPath.fileSystemIndex = fileSystemIndex;
++            resolvedPath.textureHash = hash;
++            resolvedPath.relativePath = relativePath;
++            resolvedPath.originalOperation = operation;
++            resolvedPath.originalShift = shift;
++            resolvedPath.resolvedOperation = resolveOperation(relativePath, operation);
++            resolvedPath.resolvedShift = resolveShift(relativePath, shift);
++
++            if ((resolvedPath.resolvedOperation == ReplacementOperation::Preload) && (pathsToPreload != nullptr)) {
++                pathsToPreload->insert(relativePath);
++            }
++        };
++
++        // Assign paths to all entries in the database.
++        // If the entry already has a relative path, look for textures with extensions that are valid.
++        // If the entry doesn't have a path but uses auto-path logic, then it'll try to resolve the path using that scheme.
++        uint32_t textureIndex = 0;
++        for (const ReplacementTexture &texture : textures) {
++            if (!texture.path.empty()) {
++                uint64_t hashRT64 = ReplacementDatabase::stringToHash(texture.hashes.rt64);
++                std::string relativePath = FileSystem::toForwardSlashes(texture.path);
++                std::string relativePathBase = removeKnownExtension(relativePath);
++                bool fileExists = false;
++                for (uint32_t i = 0; i < std::size(ReplacementKnownExtensions); i++) {
++                    const std::string relativePathKnown = relativePathBase + ReplacementKnownExtensions[i];
++                    std::string canonicalPath = fileSystem->makeCanonical(relativePathKnown);
++                    if (!canonicalPath.empty() && fileSystem->exists(canonicalPath)) {
++                        if (!onlyDDS || (i == 0)) {
++                            std::string relativePathFinal = FileSystem::toForwardSlashes(canonicalPath);
++                            addResolvedPath(hashRT64, relativePathFinal, texture.operation, texture.shift);
++                        }
++
++                        fileExists = true;
++                        break;
++                    }
++                }
++
++                if (!fileExists && (hashesMissing != nullptr)) {
++                    hashesMissing->emplace_back(hashRT64);
++                }
++            }
++            else {
++                // Assign the correct hash as the search string.
++                std::string searchString;
++                if (config.autoPath == ReplacementAutoPath::Rice) {
++                    searchString = texture.hashes.rice;
++                }
++                else if (config.autoPath == ReplacementAutoPath::RT64) {
++                    searchString = texture.hashes.rt64;
++                }
++
++                // Find in the auto path map the entry.
++                auto it = autoPathMap.find(searchString);
++                if (it != autoPathMap.end()) {
++                    uint64_t hashRT64 = ReplacementDatabase::stringToHash(texture.hashes.rt64);
++                    addResolvedPath(hashRT64, it->second, texture.operation, texture.shift);
++                }
++            }
++
++            textureIndex++;
++        }
++    }
++
++    void ReplacementDatabase::resolveOperations(std::unordered_map<uint64_t, ReplacementResolvedPath> &resolvedPathMap) {
++        for (auto &it : resolvedPathMap) {
++            it.second.resolvedOperation = resolveOperation(it.second.relativePath, it.second.originalOperation);
++        }
++    }
++
++    void ReplacementDatabase::resolveShifts(std::unordered_map<uint64_t, ReplacementResolvedPath> &resolvedPathMap) {
++        for (auto &it : resolvedPathMap) {
++            it.second.resolvedShift = resolveShift(it.second.relativePath, it.second.originalShift);
++        }
++    }
++
++    uint64_t ReplacementDatabase::stringToHash(const std::string &str) {
++        return strtoull(str.c_str(), nullptr, 16);
++    }
++
++    std::string ReplacementDatabase::hashToString(uint32_t hash) {
++        char hexStr[32];
++        snprintf(hexStr, sizeof(hexStr), "%08x", hash);
++        return std::string(hexStr);
++    }
++
++    std::string ReplacementDatabase::hashToString(uint64_t hash) {
++        char hexStr[32];
++        snprintf(hexStr, sizeof(hexStr), "%016" PRIx64, hash);
++        return std::string(hexStr);
++    }
++
++    bool ReplacementDatabase::isExtensionKnown(const std::string &extension) {
++        uint32_t knownExtensionCount = std::size(ReplacementKnownExtensions);
++        for (uint32_t i = 0; i < knownExtensionCount; i++) {
++            if (extension == ReplacementKnownExtensions[i]) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++
++    bool ReplacementDatabase::endsWith(const std::string &str, const std::string &end) {
++        if (str.length() >= end.length()) {
++            return (str.compare(str.length() - end.length(), end.length(), end) == 0);
++        }
++        else {
++            return false;
++        }
++    }
++
++    std::string ReplacementDatabase::toLower(std::string str) {
++        std::transform(str.begin(), str.end(), str.begin(), [](unsigned char c) { return std::tolower(c); });
++        return str;
++    };
++
++    std::string ReplacementDatabase::removeKnownExtension(const std::string &path) {
++        const std::string lowerCasePath = toLower(path);
++        for (uint32_t i = 0; i < std::size(ReplacementKnownExtensions); i++) {
++            if (endsWith(lowerCasePath, ReplacementKnownExtensions[i])) {
++                return path.substr(0, path.size() - ReplacementKnownExtensions[i].size());
++            }
++        }
++
++        return path;
++    }
++
++    void to_json(json &j, const ReplacementConfiguration &config) {
++        // Always update the configuration version to the latest one when saving.
++        ReplacementConfiguration defaultConfig;
++        j["configurationVersion"] = defaultConfig.configurationVersion;
++        j["autoPath"] = config.autoPath;
++        j["defaultOperation"] = config.defaultOperation;
++        j["defaultShift"] = config.defaultShift;
++        j["hashVersion"] = config.hashVersion;
++    }
++
++    void from_json(const json &j, ReplacementConfiguration &config) {
++        ReplacementConfiguration defaultConfig;
++        config.configurationVersion = j.value("configurationVersion", 1);
++
++        // Shift defaults to none to texture packs made with versions previous to 3, which introduced a different default for shifting.
++        ReplacementShift defaultShift = (config.configurationVersion < 3) ? ReplacementShift::None : defaultConfig.defaultShift;
++        config.autoPath = j.value("autoPath", defaultConfig.autoPath);
++        config.defaultOperation = j.value("defaultOperation", defaultConfig.defaultOperation);
++        config.defaultShift = j.value("defaultShift", defaultShift);
++        config.hashVersion = j.value("hashVersion", 1);
++    }
++
++    void to_json(json &j, const ReplacementHashes &hashes) {
++        j["rt64"] = hashes.rt64;
++        j["rice"] = hashes.rice;
++    }
++    
++    void from_json(const json &j, ReplacementHashes &hashes) {
++        ReplacementHashes defaultHashes;
++
++        // First version of the replacement database specified the hash version directly in the key name.
++        // Later versions choose to keep the version global to the file and make RT64 the unique key.
++        hashes.rt64 = j.value("rt64v1", defaultHashes.rt64);
++        hashes.rt64 = j.value("rt64", hashes.rt64);
++        hashes.rice = j.value("rice", defaultHashes.rice);
++    }
++
++    void to_json(json &j, const ReplacementTexture &texture) {
++        ReplacementTexture defaultTexture;
++        j["path"] = texture.path;
++        j["hashes"] = texture.hashes;
++
++        if (texture.operation != defaultTexture.operation) {
++            j["operation"] = texture.operation;
++        }
++
++        if (texture.shift != defaultTexture.shift) {
++            j["shift"] = texture.shift;
++        }
++    }
++
++    void from_json(const json &j, ReplacementTexture &texture) {
++        ReplacementTexture defaultTexture;
++        texture.path = j.value("path", defaultTexture.path);
++        texture.hashes = j.value("hashes", defaultTexture.hashes);
++        texture.operation = j.value("operation", defaultTexture.operation);
++        texture.shift = j.value("shift", defaultTexture.shift);
++    }
++
++    void to_json(json &j, const ReplacementOperationFilter &operationFilter) {
++        j["wildcard"] = operationFilter.wildcard;
++        j["operation"] = operationFilter.operation;
++    }
++
++    void from_json(const json &j, ReplacementOperationFilter &operationFilter) {
++        ReplacementOperationFilter defaultFilter;
++        operationFilter.wildcard = FileSystem::toForwardSlashes(j.value("wildcard", defaultFilter.wildcard));
++        operationFilter.operation = j.value("operation", defaultFilter.operation);
++    }
++
++    void to_json(json &j, const ReplacementShiftFilter &shiftFilter) {
++        j["wildcard"] = shiftFilter.wildcard;
++        j["operation"] = shiftFilter.shift;
++    }
++
++    void from_json(const json &j, ReplacementShiftFilter &shiftFilter) {
++        ReplacementShiftFilter defaultFilter;
++        shiftFilter.wildcard = FileSystem::toForwardSlashes(j.value("wildcard", defaultFilter.wildcard));
++        shiftFilter.shift = j.value("shift", defaultFilter.shift);
++    }
++
++    void to_json(json &j, const ReplacementDatabase &db) {
++        j["configuration"] = db.config;
++        j["textures"] = db.textures;
++        j["operationFilters"] = db.operationFilters;
++        j["shiftFilters"] = db.shiftFilters;
++        j["extraFiles"] = db.extraFiles;
++    }
++
++    void from_json(const json &j, ReplacementDatabase &db) {
++        ReplacementConfiguration defaultConfig;
++        db.config = j.value("configuration", defaultConfig);
++        db.textures = j.value("textures", std::vector<ReplacementTexture>());
++        db.operationFilters = j.value("operationFilters", std::vector<ReplacementOperationFilter>());
++        db.shiftFilters = j.value("shiftFilters", std::vector<ReplacementShiftFilter>());
++        db.extraFiles = j.value("extraFiles", std::vector<std::string>());
++        db.buildHashMaps();
++
++        // Update configuration version to the latest one after parsing is over.
++        db.config.configurationVersion = defaultConfig.configurationVersion;
++    }
+ };
+\ No newline at end of file
+diff --git a/src/common/rt64_replacement_database.h b/src/common/rt64_replacement_database.h
+index 3f74ea2..1c37195 100644
+--- a/src/common/rt64_replacement_database.h
++++ b/src/common/rt64_replacement_database.h
+@@ -1,153 +1,155 @@
+-//
+-// RT64
+-//
+-
+-#include <filesystem>
+-#include <unordered_set>
+-
+-#include <json/json.hpp>
+-
+-#include "rt64_filesystem.h"
+-
+-using json = nlohmann::json;
+-
+-namespace RT64 {
+-    extern const std::string ReplacementDatabaseFilename;
+-    extern const std::string ReplacementLowMipCacheFilename;
+-    extern const std::string ReplacementPackExtension;
+-    extern const std::string ReplacementKnownExtensions[];
+-    extern const uint32_t ReplacementMipmapCacheHeaderMagic;
+-    extern const uint32_t ReplacementMipmapCacheHeaderVersion;
+-
+-    enum class ReplacementOperation {
+-        Preload,
+-        Stream,
+-        Stall,
+-        Auto,
+-    };
+-
+-    enum class ReplacementShift {
+-        None,
+-        Half,
+-        Auto,
+-    };
+-
+-    enum class ReplacementAutoPath {
+-        RT64,
+-        Rice,
+-    };
+-
+-    NLOHMANN_JSON_SERIALIZE_ENUM(ReplacementOperation, {
+-        { ReplacementOperation::Preload, "preload" },
+-        { ReplacementOperation::Stream, "stream" },
+-        { ReplacementOperation::Stall, "stall" },
+-        { ReplacementOperation::Auto, "auto" },
+-    });
+-
+-    NLOHMANN_JSON_SERIALIZE_ENUM(ReplacementShift, {
+-        { ReplacementShift::None, "none" },
+-        { ReplacementShift::Half, "half" },
+-        { ReplacementShift::Auto, "auto" },
+-    });
+-
+-    NLOHMANN_JSON_SERIALIZE_ENUM(ReplacementAutoPath, {
+-        { ReplacementAutoPath::RT64, "rt64" },
+-        { ReplacementAutoPath::Rice, "rice" },
+-    });
+-
+-    struct ReplacementConfiguration {
+-        ReplacementAutoPath autoPath = ReplacementAutoPath::RT64;
+-        ReplacementOperation defaultOperation = ReplacementOperation::Stream;
+-        ReplacementShift defaultShift = ReplacementShift::Half;
+-        uint32_t configurationVersion = 3;
+-        uint32_t hashVersion = 5;
+-    };
+-
+-    struct ReplacementHashes {
+-        std::string rt64;
+-        std::string rice;
+-    };
+-
+-    struct ReplacementTexture {
+-        std::string path;
+-        ReplacementHashes hashes;
+-        ReplacementOperation operation = ReplacementOperation::Auto;
+-        ReplacementShift shift = ReplacementShift::Auto;
+-
+-        bool isEmpty() const {
+-            return hashes.rt64.empty();
+-        }
+-    };
+-
+-    struct ReplacementFilter {
+-        std::string wildcard;
+-    };
+-
+-    struct ReplacementOperationFilter : ReplacementFilter {
+-        ReplacementOperation operation = ReplacementOperation::Stream;
+-    };
+-
+-    struct ReplacementShiftFilter : ReplacementFilter {
+-        ReplacementShift shift = ReplacementShift::Half;
+-    };
+-
+-    struct ReplacementResolvedPath {
+-        uint32_t fileSystemIndex = 0;
+-        uint64_t textureHash = 0;
+-        std::string relativePath;
+-        ReplacementOperation resolvedOperation = ReplacementOperation::Auto;
+-        ReplacementOperation originalOperation = ReplacementOperation::Auto;
+-        ReplacementShift resolvedShift = ReplacementShift::Auto;
+-        ReplacementShift originalShift = ReplacementShift::Auto;
+-    };
+-
+-    struct ReplacementMipmapCacheHeader {
+-        uint32_t magic = ReplacementMipmapCacheHeaderMagic;
+-        uint32_t version = ReplacementMipmapCacheHeaderVersion;
+-        uint32_t width = 0;
+-        uint32_t height = 0;
+-        uint32_t dxgiFormat = 0;
+-        uint32_t mipCount = 0;
+-        uint32_t pathLength = 0;
+-    };
+-
+-    struct ReplacementDatabase {
+-        ReplacementConfiguration config;
+-        std::vector<ReplacementTexture> textures;
+-        std::vector<ReplacementOperationFilter> operationFilters;
+-        std::vector<ReplacementShiftFilter> shiftFilters;
+-        std::vector<std::string> extraFiles;
+-        std::unordered_map<uint64_t, uint32_t> tmemHashToReplaceMap;
+-
+-        uint32_t addReplacement(const ReplacementTexture &texture);
+-        void fixReplacement(const std::string &hash, const ReplacementTexture &texture);
+-        ReplacementTexture getReplacement(uint64_t hash) const;
+-        ReplacementTexture getReplacement(const std::string &hash) const;
+-        void buildHashMaps();
+-        ReplacementOperation resolveOperation(const std::string &relativePath, ReplacementOperation operation);
+-        ReplacementShift resolveShift(const std::string &relativePath, ReplacementShift shift);
+-        void resolvePaths(const FileSystem *fileSystem, uint32_t fileSystemIndex, std::unordered_map<uint64_t, ReplacementResolvedPath> &resolvedPathMap, bool onlyDDS, std::vector<uint64_t> *hashesMissing = nullptr, std::unordered_set<std::string> *pathsToPreload = nullptr);
+-        void resolveOperations(std::unordered_map<uint64_t, ReplacementResolvedPath> &resolvedPathMap);
+-        void resolveShifts(std::unordered_map<uint64_t, ReplacementResolvedPath> &resolvedPathMap);
+-        static uint64_t stringToHash(const std::string &str);
+-        static std::string hashToString(uint32_t hash);
+-        static std::string hashToString(uint64_t hash);
+-        static bool isExtensionKnown(const std::string &extension);
+-        static bool endsWith(const std::string &str, const std::string &end);
+-        static std::string toLower(std::string str);
+-        static std::string removeKnownExtension(const std::string &path);
+-    };
+-
+-    extern void to_json(json &j, const ReplacementConfiguration &config);
+-    extern void from_json(const json &j, ReplacementConfiguration &config);
+-    extern void to_json(json &j, const ReplacementHashes &hashes);
+-    extern void from_json(const json &j, ReplacementHashes &hashes);
+-    extern void to_json(json &j, const ReplacementTexture &texture);
+-    extern void from_json(const json &j, ReplacementTexture &texture);
+-    extern void to_json(json &j, const ReplacementOperationFilter &operationFilter);
+-    extern void from_json(const json &j, ReplacementOperationFilter &operationFilter);
+-    extern void to_json(json &j, const ReplacementShiftFilter &shiftFilter);
+-    extern void from_json(const json &j, ReplacementShiftFilter &shiftFilter);
+-    extern void to_json(json &j, const ReplacementDatabase &db);
+-    extern void from_json(const json &j, ReplacementDatabase &db);
++//
++// RT64
++//
++
++#include <filesystem>
++#include <unordered_set>
++
++#include <json/json.hpp>
++
++#include "rt64_filesystem.h"
++
++using json = nlohmann::json;
++
++namespace RT64 {
++    extern const std::string ReplacementDatabaseFilename;
++    extern const std::string ReplacementLowMipCacheFilename;
++    extern const std::string ReplacementPackExtension;
++    extern const std::string ReplacementKnownExtensions[];
++    extern const uint32_t ReplacementMipmapCacheHeaderMagic;
++    extern const uint32_t ReplacementMipmapCacheHeaderVersion;
++
++    enum class ReplacementOperation {
++        Preload,
++        Stream,
++        Stall,
++        Auto,
++    };
++
++    enum class ReplacementShift {
++        None,
++        Half,
++        Auto,
++    };
++
++    enum class ReplacementAutoPath {
++        RT64,
++        Rice,
++    };
++
++    NLOHMANN_JSON_SERIALIZE_ENUM(ReplacementOperation, {
++        { ReplacementOperation::Preload, "preload" },
++        { ReplacementOperation::Stream, "stream" },
++        { ReplacementOperation::Stall, "stall" },
++        { ReplacementOperation::Auto, "auto" },
++    });
++
++    NLOHMANN_JSON_SERIALIZE_ENUM(ReplacementShift, {
++        { ReplacementShift::None, "none" },
++        { ReplacementShift::Half, "half" },
++        { ReplacementShift::Auto, "auto" },
++    });
++
++    NLOHMANN_JSON_SERIALIZE_ENUM(ReplacementAutoPath, {
++        { ReplacementAutoPath::RT64, "rt64" },
++        { ReplacementAutoPath::Rice, "rice" },
++    });
++
++    struct ReplacementConfiguration {
++        ReplacementAutoPath autoPath = ReplacementAutoPath::RT64;
++        ReplacementOperation defaultOperation = ReplacementOperation::Stream;
++        ReplacementShift defaultShift = ReplacementShift::Half;
++        uint32_t configurationVersion = 3;
++        uint32_t hashVersion = 5;
++    };
++
++    struct ReplacementHashes {
++        std::string rt64;
++        std::string rice;
++    };
++
++    struct ReplacementTexture {
++        std::string path;
++        ReplacementHashes hashes;
++        ReplacementOperation operation = ReplacementOperation::Auto;
++        ReplacementShift shift = ReplacementShift::Auto;
++
++        bool isEmpty() const {
++            return hashes.rt64.empty();
++        }
++    };
++
++    struct ReplacementFilter {
++        std::string wildcard;
++    };
++
++    struct ReplacementOperationFilter : ReplacementFilter {
++        ReplacementOperation operation = ReplacementOperation::Stream;
++    };
++
++    struct ReplacementShiftFilter : ReplacementFilter {
++        ReplacementShift shift = ReplacementShift::Half;
++    };
++
++    struct ReplacementResolvedPath {
++        uint32_t fileSystemIndex = 0;
++        uint64_t textureHash = 0;
++        std::string relativePath;
++        ReplacementOperation resolvedOperation = ReplacementOperation::Auto;
++        ReplacementOperation originalOperation = ReplacementOperation::Auto;
++        ReplacementShift resolvedShift = ReplacementShift::Auto;
++        ReplacementShift originalShift = ReplacementShift::Auto;
++    };
++
++    struct ReplacementMipmapCacheHeader {
++        uint32_t magic = ReplacementMipmapCacheHeaderMagic;
++        uint32_t version = ReplacementMipmapCacheHeaderVersion;
++        uint32_t width = 0;
++        uint32_t height = 0;
++        uint32_t dxgiFormat = 0;
++        uint32_t mipCount = 0;
++        uint32_t pathLength = 0;
++    };
++
++    struct ReplacementDatabase {
++        ReplacementConfiguration config;
++        std::vector<ReplacementTexture> textures;
++        std::vector<ReplacementOperationFilter> operationFilters;
++        std::vector<ReplacementShiftFilter> shiftFilters;
++        std::vector<std::string> extraFiles;
++        std::unordered_map<uint64_t, uint32_t> tmemHashToReplaceMap;
++
++        uint32_t addReplacement(const ReplacementTexture &texture);
++        void fixReplacement(const std::string &hash, const ReplacementTexture &texture);
++        ReplacementTexture getReplacement(uint64_t hash) const;
++        ReplacementTexture getReplacement(const std::string &hash) const;
++        void buildHashMaps();
++        ReplacementOperation resolveOperation(const std::string &relativePath, ReplacementOperation operation);
++        ReplacementShift resolveShift(const std::string &relativePath, ReplacementShift shift);
++        // With ricePathMap, a database whose auto path is Rice also gives each file found by its Rice hash, resolved as an
++        // entry without a path would be: for textures matched by their Rice hash as they're loaded (hle/rt64_rice_hash.h).
++        void resolvePaths(const FileSystem *fileSystem, uint32_t fileSystemIndex, std::unordered_map<uint64_t, ReplacementResolvedPath> &resolvedPathMap, bool onlyDDS, std::vector<uint64_t> *hashesMissing = nullptr, std::unordered_set<std::string> *pathsToPreload = nullptr, std::unordered_map<std::string, ReplacementResolvedPath> *ricePathMap = nullptr);
++        void resolveOperations(std::unordered_map<uint64_t, ReplacementResolvedPath> &resolvedPathMap);
++        void resolveShifts(std::unordered_map<uint64_t, ReplacementResolvedPath> &resolvedPathMap);
++        static uint64_t stringToHash(const std::string &str);
++        static std::string hashToString(uint32_t hash);
++        static std::string hashToString(uint64_t hash);
++        static bool isExtensionKnown(const std::string &extension);
++        static bool endsWith(const std::string &str, const std::string &end);
++        static std::string toLower(std::string str);
++        static std::string removeKnownExtension(const std::string &path);
++    };
++
++    extern void to_json(json &j, const ReplacementConfiguration &config);
++    extern void from_json(const json &j, ReplacementConfiguration &config);
++    extern void to_json(json &j, const ReplacementHashes &hashes);
++    extern void from_json(const json &j, ReplacementHashes &hashes);
++    extern void to_json(json &j, const ReplacementTexture &texture);
++    extern void from_json(const json &j, ReplacementTexture &texture);
++    extern void to_json(json &j, const ReplacementOperationFilter &operationFilter);
++    extern void from_json(const json &j, ReplacementOperationFilter &operationFilter);
++    extern void to_json(json &j, const ReplacementShiftFilter &shiftFilter);
++    extern void from_json(const json &j, ReplacementShiftFilter &shiftFilter);
++    extern void to_json(json &j, const ReplacementDatabase &db);
++    extern void from_json(const json &j, ReplacementDatabase &db);
+ };
+\ No newline at end of file
+diff --git a/src/hle/rt64_rdp_tmem.cpp b/src/hle/rt64_rdp_tmem.cpp
+index ef6ad57..3c8c05e 100644
+--- a/src/hle/rt64_rdp_tmem.cpp
++++ b/src/hle/rt64_rdp_tmem.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "common/rt64_tmem_hasher.h"
+ 
++#include "rt64_rice_hash.h"
+ #include "rt64_state.h"
+ 
+ namespace RT64 {
+@@ -52,6 +53,7 @@ namespace RT64 {
+     uint64_t TextureManager::uploadTexture(State *state, const LoadTile &loadTile, TextureCache *textureCache, uint64_t creationFrame, uint16_t width, uint16_t height, uint32_t tlut) {
+         const uint8_t *TMEM = reinterpret_cast<const uint8_t *>(state->rdp->TMEM);
+         uint64_t hash = TMEMHasher::hash(TMEM, loadTile, width, height, tlut, TMEMHasher::CurrentHashVersion);
++        checkRiceReplacement(state, loadTile, textureCache, hash, width, height, tlut);
+         if (hashSet.find(hash) == hashSet.end()) {
+             hashSet.insert(hash);
+             textureCache->queueGPUUploadTMEM(hash, creationFrame, TMEM, RDP_TMEM_BYTES, width, height, tlut, loadTile, true);
+@@ -188,6 +190,27 @@ namespace RT64 {
+         }
+     }
+ 
++    void TextureManager::checkRiceReplacement(State *state, const LoadTile &loadTile, TextureCache *textureCache, uint64_t hash, uint16_t width, uint16_t height, uint32_t tlut) {
++        if (!textureCache->hasRiceReplacements() || (width == 0) || (height == 0)) {
++            return;
++        }
++
++        const uint32_t generation = textureCache->getRiceGeneration();
++        if (generation != riceCheckedGeneration) {
++            riceCheckedSet.clear();
++            riceCheckedGeneration = generation;
++        }
++
++        if (!riceCheckedSet.insert(hash).second) {
++            return;
++        }
++
++        const std::vector<std::string> riceKeys = riceTextureKeys(state, loadTile, width, height, tlut);
++        if (!riceKeys.empty()) {
++            textureCache->addRiceReplacement(hash, riceKeys, generation);
++        }
++    }
++
+     void TextureManager::removeHashes(const std::vector<uint64_t> &hashes) {
+         for (uint64_t hash : hashes) {
+             hashSet.erase(hash);
+diff --git a/src/hle/rt64_rdp_tmem.h b/src/hle/rt64_rdp_tmem.h
+index 3708220..9f76fa1 100644
+--- a/src/hle/rt64_rdp_tmem.h
++++ b/src/hle/rt64_rdp_tmem.h
+@@ -1,25 +1,33 @@
+-//
+-// RT64
+-//
+-
+-#pragma once
+-
+-#include <set>
+-
+-#include "hle/rt64_draw_call.h"
+-#include "render/rt64_texture_cache.h"
+-
+-namespace RT64 {
+-    struct State;
+-
+-    struct TextureManager {
+-        std::set<uint64_t> hashSet;
+-        std::set<uint64_t> dumpedSet;
+-
+-        void uploadEmpty(State *state, TextureCache *textureCache, uint64_t creationFrame, uint16_t width, uint16_t height, uint64_t replacementHash);
+-        uint64_t uploadTMEM(State *state, const LoadTile &loadTile, TextureCache *textureCache, uint64_t creationFrame, uint16_t byteOffset, uint16_t byteCount, uint16_t width, uint16_t height, uint32_t tlut);
+-        uint64_t uploadTexture(State *state, const LoadTile &loadTile, TextureCache *textureCache, uint64_t creationFrame, uint16_t width, uint16_t height, uint32_t tlut);
+-        void dumpTexture(uint64_t hash, State *state, const LoadTile &loadTile, uint16_t width, uint16_t height, uint32_t tlut);
+-        void removeHashes(const std::vector<uint64_t> &hashes);
+-    };
++//
++// RT64
++//
++
++#pragma once
++
++#include <set>
++
++#include "hle/rt64_draw_call.h"
++#include "render/rt64_texture_cache.h"
++
++namespace RT64 {
++    struct State;
++
++    struct TextureManager {
++        std::set<uint64_t> hashSet;
++        std::set<uint64_t> dumpedSet;
++
++        // Textures already matched against the Rice-named packs (TextureCache::getRiceGeneration: since they last changed).
++        std::set<uint64_t> riceCheckedSet;
++        uint32_t riceCheckedGeneration = 0;
++
++        // With a Rice-named pack loaded, the first time a texture is seen, its Rice names are worked out (rt64_rice_hash.h)
++        // for the texture cache to find its replacement by.
++        void checkRiceReplacement(State *state, const LoadTile &loadTile, TextureCache *textureCache, uint64_t hash, uint16_t width, uint16_t height, uint32_t tlut);
++
++        void uploadEmpty(State *state, TextureCache *textureCache, uint64_t creationFrame, uint16_t width, uint16_t height, uint64_t replacementHash);
++        uint64_t uploadTMEM(State *state, const LoadTile &loadTile, TextureCache *textureCache, uint64_t creationFrame, uint16_t byteOffset, uint16_t byteCount, uint16_t width, uint16_t height, uint32_t tlut);
++        uint64_t uploadTexture(State *state, const LoadTile &loadTile, TextureCache *textureCache, uint64_t creationFrame, uint16_t width, uint16_t height, uint32_t tlut);
++        void dumpTexture(uint64_t hash, State *state, const LoadTile &loadTile, uint16_t width, uint16_t height, uint32_t tlut);
++        void removeHashes(const std::vector<uint64_t> &hashes);
++    };
+ };
+\ No newline at end of file
+diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+index 0848f3e..29b41dd 100644
+--- a/src/render/rt64_texture_cache.cpp
++++ b/src/render/rt64_texture_cache.cpp
+@@ -995,6 +995,14 @@ namespace RT64 {
+                     return !uploadThreadRunning || !uploadQueue.empty() || !resolvedPathQueue.empty() || !streamResultQueue.empty();
+                 });
+ 
++            }
++
++            std::unique_lock replacementLock(replacementUploadMutex);
++            {
++                std::unique_lock queueLock(uploadQueueMutex);
++                if (!uploadThreadRunning) {
++                    break;
++                }
+                 if (!uploadQueue.empty()) {
+                     queueCopy = uploadQueue;
+                 }
+@@ -1298,6 +1306,7 @@ namespace RT64 {
+             }
+         }
+ 
++        bool found = false;
+         for (int32_t i = int32_t(textureMap.replacementMap.fileSystemResolvedPaths.size()) - 1; i >= 0; i--) {
+             const auto &fsResolvedPaths = textureMap.replacementMap.fileSystemResolvedPaths[i];
+             uint32_t hashVersion = textureMap.replacementMap.fileSystemHashVersions[i];
+@@ -1306,10 +1315,20 @@ namespace RT64 {
+                 if (it != fsResolvedPaths.end()) {
+                     // Stop searching for replacements as soon as we find one.
+                     resolvedPaths.emplace_back(it->second);
++                    found = true;
+                     break;
+                 }
+             }
+         }
++
++        // Otherwise, a texture matched to a Rice-named pack as it was loaded.
++        if (!found && (exclusiveDbHash == 0) && riceReplacementsLoaded) {
++            std::unique_lock riceLock(riceMutex);
++            auto it = riceMatchedPaths.find(hash);
++            if (it != riceMatchedPaths.end()) {
++                resolvedPaths.emplace_back(it->second);
++            }
++        }
+     }
+ 
+     bool TextureCache::useTexture(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex, interop::float2 &textureScale, interop::float3 &textureDimensions, bool &textureReplaced, bool &hasMipmaps, bool &shiftedByHalf) {
+@@ -1394,6 +1413,64 @@ namespace RT64 {
+         return true;
+     }
+ 
++    bool TextureCache::hasRiceReplacements() const {
++        return riceReplacementsLoaded;
++    }
++
++    uint32_t TextureCache::getRiceGeneration() const {
++        return riceGeneration;
++    }
++
++    void TextureCache::addRiceReplacement(uint64_t hash, const std::vector<std::string> &riceKeys, uint32_t generation) {
++        std::unique_lock replacementLock(replacementUploadMutex);
++        if (generation != riceGeneration) {
++            return;
++        }
++
++        // A pack's database replacing the texture comes first.
++        {
++            std::unique_lock lock(textureMapMutex);
++            for (const auto &fsResolvedPaths : textureMap.replacementMap.fileSystemResolvedPaths) {
++                if (fsResolvedPaths.find(hash) != fsResolvedPaths.end()) {
++                    return;
++                }
++            }
++        }
++
++        // The last pack with a file for one of its names, as with the databases.
++        ReplacementResolvedPath resolvedPath;
++        bool found = false;
++        {
++            std::unique_lock riceLock(riceMutex);
++            for (int32_t i = int32_t(riceFileSystemPaths.size()) - 1; (i >= 0) && !found; i--) {
++                for (const std::string &riceKey : riceKeys) {
++                    auto it = riceFileSystemPaths[i].find(riceKey);
++                    if (it != riceFileSystemPaths[i].end()) {
++                        resolvedPath = it->second;
++                        resolvedPath.textureHash = hash;
++                        riceMatchedPaths[hash] = resolvedPath;
++                        if (riceMatchedPaths.size() <= 6) {
++                            fprintf(stdout, "[Textures] Matched %s\n", resolvedPath.relativePath.c_str());
++                        }
++                        found = true;
++                        break;
++                    }
++                }
++            }
++        }
++
++        if (!found) {
++            return;
++        }
++
++        // A texture uploaded already (it was loaded before the pack) is checked for its replacement again. One not uploaded
++        // yet finds it in riceMatchedPaths when it is (addResolvedPaths), and this check does nothing to it (TextureMap::replace).
++        uploadQueueMutex.lock();
++        resolvedPathQueue.emplace_back(resolvedPath);
++        uploadQueueMutex.unlock();
++        uploadQueueChanged.notify_all();
++    }
++
+     bool TextureCache::hasReplacement(uint64_t hash) {
+         std::unique_lock lock(textureMapMutex);
+         const auto &resolvedPaths = textureMap.replacementMap.fileSystemResolvedPaths;
+@@ -1407,6 +1484,11 @@ namespace RT64 {
+     }
+ 
+     void TextureCache::clearReplacementDirectories() {
++        std::unique_lock replacementLock(replacementUploadMutex);
++        clearReplacementDirectoriesLocked();
++    }
++
++    void TextureCache::clearReplacementDirectoriesLocked() {
+         // Wait for the streaming threads to be finished.
+         waitForAllStreamThreads(true);
+ 
+@@ -1421,11 +1503,21 @@ namespace RT64 {
+             }
+ 
+             streamResultQueue.clear();
++            resolvedPathQueue.clear();
+         }
+ 
+         // Clear the current set of textures that were sent to streaming threads.
+         textureMap.replacementMap.fileSystemStreamSets.clear();
+ 
++        // Forget the Rice-named packs and the textures matched to them.
++        {
++            std::unique_lock riceLock(riceMutex);
++            riceFileSystemPaths.clear();
++            riceMatchedPaths.clear();
++            riceReplacementsLoaded = false;
++            riceGeneration++;
++        }
++
+         // Clear the pending replacement checks for streamed textures.
+         textureMap.replacementMap.fileSystemStreamResolvedPaths.clear();
+ 
+@@ -1460,7 +1552,8 @@ namespace RT64 {
+     }
+     
+     bool TextureCache::loadReplacementDirectories(const std::vector<ReplacementDirectory> &replacementDirectories) {
+-        clearReplacementDirectories();
++        std::unique_lock replacementLock(replacementUploadMutex);
++        clearReplacementDirectoriesLocked();
+ 
+         std::unique_lock lock(textureMapMutex);
+         textureMap.replacementMap.replacementDirectories = replacementDirectories;
+@@ -1502,6 +1595,9 @@ namespace RT64 {
+             }
+         }
+ 
++        // Each file system's files by Rice hash, if its database's auto path is Rice.
++        std::vector<std::unordered_map<std::string, ReplacementResolvedPath>> ricePaths(fileSystems.size());
++
+         // Load databases and low mipmap caches from the filesystems in reverse order.
+         {
+             loaderCommandList->begin();
+@@ -1518,7 +1614,7 @@ namespace RT64 {
+                         db = json::parse(databaseBytes.begin(), databaseBytes.end(), nullptr, true);
+ 
+                         if (db.config.hashVersion <= TMEMHasher::CurrentHashVersion) {
+-                            db.resolvePaths(fileSystems[i].get(), uint32_t(i), fileSystemResolvedPaths[i], false, nullptr, &fileSystemStreamSets[i]);
++                            db.resolvePaths(fileSystems[i].get(), uint32_t(i), fileSystemResolvedPaths[i], false, nullptr, &fileSystemStreamSets[i], &ricePaths[i]);
+                             fileSystemHashVersions[i] = db.config.hashVersion;
+                             knownHashVersions.insert(db.config.hashVersion);
+ 
+@@ -1564,6 +1660,22 @@ namespace RT64 {
+         textureMap.replacementMap.fileSystemStreamSets = std::move(fileSystemStreamSets);
+         textureMap.replacementMap.fileSystemStreamResolvedPaths.resize(fileSystemCount);
+ 
++        {
++            std::unique_lock riceLock(riceMutex);
++            riceFileSystemPaths = std::move(ricePaths);
++            riceMatchedPaths.clear();
++            size_t ricePathCount = 0;
++            for (const auto &fsRicePaths : riceFileSystemPaths) {
++                ricePathCount += fsRicePaths.size();
++            }
++
++            if (ricePathCount > 0) {
++                fprintf(stdout, "[Textures] Indexed %zu replacement images\n", ricePathCount);
++            }
++            riceReplacementsLoaded = ricePathCount > 0;
++            riceGeneration++;
++        }
++
+         // Queue all textures that must be preloaded to the stream queues.
+         bool texturesPreloaded = false;
+         {
+diff --git a/src/render/rt64_texture_cache.h b/src/render/rt64_texture_cache.h
+index 9131697..abcec69 100644
+--- a/src/render/rt64_texture_cache.h
++++ b/src/render/rt64_texture_cache.h
+@@ -220,6 +220,17 @@ namespace RT64 {
+         uint64_t streamLoadCount = 0;
+         TextureMap textureMap;
+         std::mutex textureMapMutex;
++        // A pack switch must wait for the upload batch using its filesystem to finish.
++        std::mutex replacementUploadMutex;
++        void clearReplacementDirectoriesLocked();
++
++        // Packs named for Rice (auto path Rice): each file system's files by Rice hash, and the textures matched to them
++        // as they were loaded (hle/rt64_rice_hash.h), looked up when a texture has no other replacement.
++        std::mutex riceMutex;
++        std::vector<std::unordered_map<std::string, ReplacementResolvedPath>> riceFileSystemPaths;
++        std::unordered_map<uint64_t, ReplacementResolvedPath> riceMatchedPaths;
++        std::atomic<bool> riceReplacementsLoaded = false;
++        std::atomic<uint32_t> riceGeneration = 0;
+         RenderWorker *directWorker;
+         RenderWorker *copyWorker;
+         std::unique_ptr<RenderCommandList> loaderCommandList;
+@@ -240,6 +251,14 @@ namespace RT64 {
+         bool useTexture(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex);
+         bool addReplacement(uint64_t hash, const std::string &relativePath, ReplacementShift shift);
+         bool hasReplacement(uint64_t hash);
++
++        // Whether a loaded pack is named for Rice, and a count that changes whenever the packs do.
++        bool hasRiceReplacements() const;
++        uint32_t getRiceGeneration() const;
++
++        // The texture with this hash has these Rice names (the most likely first): replace it with the file a Rice-named
++        // pack has for one of them, unless a pack's database already replaces it.
++        void addRiceReplacement(uint64_t hash, const std::vector<std::string> &riceKeys, uint32_t generation);
+         void clearReplacementDirectories();
+         void reloadReplacements(bool clearQueue, uint64_t exclusiveDbHash = 0);
+         bool loadReplacementDirectory(const ReplacementDirectory &replacementDirectory);

@@ -1,0 +1,18 @@
+diff --git a/Source/Core/Elements/WidgetDropDown.cpp b/Source/Core/Elements/WidgetDropDown.cpp
+index b4c0fc3..e2d4bca 100644
+--- a/Source/Core/Elements/WidgetDropDown.cpp
++++ b/Source/Core/Elements/WidgetDropDown.cpp
+@@ -578,6 +578,13 @@ void WidgetDropDown::ProcessEvent(Event& event)
+ 			SeekSelection(true);
+ 			event.StopPropagation();
+ 			break;
++		case Input::KI_ESCAPE:
++			if (box_visible)
++			{
++				ShowSelectBox(false);
++				event.StopPropagation();
++			}
++			break;
+ 		case Input::KI_RETURN:
+ 		case Input::KI_NUMPADENTER:
+ 			parent_element->Click();

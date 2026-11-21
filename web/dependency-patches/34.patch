@@ -1,0 +1,117 @@
+diff --git a/frontend/CMakeLists.txt b/frontend/CMakeLists.txt
+index c9ab780..18942de 100644
+--- a/frontend/CMakeLists.txt
++++ b/frontend/CMakeLists.txt
+@@ -40,7 +40,6 @@ target_link_options(n64recomp_browser_frontend INTERFACE
+     -lidbfs.js
+     "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$addRunDependency,$removeRunDependency"
+     "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/persistent_home.js"
+-    "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/save_sync.js"
+     "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/sdl_audio.js"
+     "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/audio_output.js"
+     "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/worker_alert.js"
+diff --git a/frontend/shell.html b/frontend/shell.html
+index 2333a29..cca5685 100644
+--- a/frontend/shell.html
++++ b/frontend/shell.html
+@@ -45,8 +45,12 @@
+   @keyframes spin { to { transform: rotate(360deg); } }
+   #gpu button { position: absolute; right: 6px; top: 4px; border: 0; background: none; color: #aaa; font-size: 18px;
+                 cursor: pointer; }
++  #status .start-controls { display:flex; justify-content:center; gap:.75rem; margin-top:1rem; pointer-events:auto; }
++  #status button, #status select { padding:.65rem .9rem; border:1px solid #52607b; border-radius:8px; background:#1a2234; color:#faf5e8; }
++  #status button { background:#fad58e; color:#262019; cursor:pointer; }
++  #status button:disabled { opacity:.6; cursor:wait; }
+ </style>
+-<script src="coi_serviceworker.js"></script>
++<script src="web-assets.js"></script>
+ </head>
+ <body>
+ <canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
+@@ -64,7 +68,7 @@
+     fail('This page needs cross-origin isolation for its threads. Reload it once; if that doesn\'t help, the server must ' +
+          'send Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp.');
+   } else if (!navigator.gpu) {
+-    fail('This browser has no WebGPU. It runs in a recent Chrome or Edge.');
++    fail('This game needs WebGPU. Try Safari on iOS 26 or a current desktop browser.');
+   }
+   // RT64 reports each shader built, with the fraction done by size, the ones in flight counted half done
+   // (rt64ShaderProgress), once before the game starts and again whenever it goes somewhere new, a level whose shaders
+@@ -198,28 +202,57 @@
+   // recomp.cpp), noted here for a start that comes before the script, which then takes the call over.
+   if (matchMedia('(pointer: coarse)').matches) {
+     Module.gameStarted = () => { Module.gameRunning = true; };
+-    document.head.append(Object.assign(document.createElement('script'), { src: '/touch_pad.js' }));
++    document.head.append(Object.assign(document.createElement('script'), { src: './touch_pad.js' }));
+   }
+-  // The program (its script, in #program) starts only on a page that is cross-origin isolated, which it needs anyway.
+-  // A first visit to a host that can't send the headers isn't, and coi_serviceworker.js reloads it: started there, the
+-  // program fetched its .wasm and .data only for the reload to cut them off, and in Firefox (158, from GitHub Pages)
+-  // the reloaded page's fetches of the same files then failed in 4 of 58 cold visits, which never started; with
+-  // nothing fetched before the reload, none of 30 failed.
+-  // A player who signed in on the hub for their saves to sync (save_sync.js) has a token for an hour. A page opened on
+-  // its own whose token has run out, or will within a quarter of an hour, goes to the hub for a new one first, which
+-  // comes back here at once (at most once a minute); in the hub's frame, the hub renews it.
+-  const renewing = window.crossOriginIsolated && (() => {
+-    try {
+-      const sync = JSON.parse(localStorage.getItem('save-sync'));
+-      if (window !== top || !sync?.hub || !sync.token || sync.expires > Date.now() + 15 * 60000 ||
+-          Date.now() - (sync.tried || 0) < 60000) return false;
+-      location.replace(sync.hub + '#sync-refresh=' + encodeURIComponent(location.href));
+-      return true;
+-    } catch { return false; }
+-  })();
+-  if (window.crossOriginIsolated && !renewing) {
+-    document.body.append(document.importNode(document.getElementById('program').content, true));
++  async function startWinks() {
++    await window.winksCacheReady;
++    if (!window.crossOriginIsolated) {
++      if (!sessionStorage.getItem("winks-isolation")) {
++        sessionStorage.setItem("winks-isolation", "1");
++        location.reload();
++      }
++      return;
++    }
++    sessionStorage.removeItem("winks-isolation");
++    if (!navigator.gpu) return;
++
++    const catalog = await window.winksCatalog();
++    const choice = document.createElement("select");
++    choice.setAttribute("aria-label", "Texture pack");
++    for (const tier of ["Original", ...Object.keys(catalog.packs)]) {
++      choice.add(new Option(tier === "Original" ? tier : tier + " textures", tier));
++    }
++    const preferred = localStorage.getItem("winks-texture-tier");
++    const mobile = matchMedia("(pointer: coarse)").matches;
++    const defaultTier = mobile && catalog.packs.Mobile ? "Mobile" : (catalog.packs.HD ? "HD" : "Original");
++    choice.value = preferred === "Original" || catalog.packs[preferred] ? preferred : defaultTier;
++    const play = document.createElement("button");
++    play.textContent = "Play";
++    const controls = document.createElement("div");
++    controls.className = "start-controls";
++    controls.append(choice, play);
++    const text = document.createElement("span");
++    text.textContent = "40 Winks HD";
++    statusLine.style.color = "";
++    statusLine.className = "";
++    statusLine.replaceChildren(text, controls);
++
++    play.onclick = async () => {
++      play.disabled = choice.disabled = true;
++      try {
++        Module.winksTexturePack = await window.prepareWinksAssets(catalog, choice.value, (done, total, name) => {
++          text.textContent = "Preparing " + done + "/" + total + " · " + name.split("/").at(-1);
++        });
++        localStorage.setItem("winks-texture-tier", choice.value);
++        document.body.append(document.importNode(document.getElementById("program").content, true));
++      } catch (error) {
++        text.textContent = error.message;
++        play.textContent = "Retry";
++        play.disabled = choice.disabled = false;
++      }
++    };
+   }
++  startWinks().catch(error => fail(error.message));
+ </script>
+ </body>
+ </html>
